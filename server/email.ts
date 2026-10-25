@@ -15,6 +15,11 @@ const from=process.env.MAIL_FROM||'';
 const publicUrl=process.env.APP_PUBLIC_URL||'';
 const smtpPort=Number(process.env.SMTP_PORT||587);
 if(mailMode==='smtp'&&(!process.env.SMTP_HOST||!process.env.SMTP_USER||!process.env.SMTP_PASSWORD||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(from)||!Number.isInteger(smtpPort)||smtpPort<1||smtpPort>65535)) throw new Error('SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD ve MAIL_FROM .env içinde gerekli.');
+export function smtpSecuritySettings(){return {port:smtpPort,secure:smtpPort===465,requireTLS:smtpPort!==465,certificateVerification:true};}
+function smtpClient(){
+  const security=smtpSecuritySettings();
+  return nodemailer.createTransport({host:process.env.SMTP_HOST!,port:security.port,secure:security.secure,requireTLS:security.requireTLS,tls:{rejectUnauthorized:security.certificateVerification},auth:{user:process.env.SMTP_USER!,pass:process.env.SMTP_PASSWORD!},connectionTimeout:12000,greetingTimeout:10000,socketTimeout:15000});
+}
 export function publicInvitationBase():string|null{
   try{
     const url=new URL(publicUrl);
@@ -40,13 +45,13 @@ async function transport(message:Message):Promise<void>{
     return;
   }
   if(mailMode!=='smtp') throw new MailFailure('configuration');
-  const client=nodemailer.createTransport({host:process.env.SMTP_HOST!,port:smtpPort,secure:smtpPort===465,requireTLS:smtpPort!==465,auth:{user:process.env.SMTP_USER!,pass:process.env.SMTP_PASSWORD!},connectionTimeout:12000,greetingTimeout:10000,socketTimeout:15000});
+  const client=smtpClient();
   const result=await client.sendMail({from,to:message.to,subject:message.subject,text:message.text,html:message.html});
   if(!result.accepted?.some(address=>address.toLowerCase()===message.to.toLowerCase())) throw new MailFailure('rejected');
 }
 export async function verifySmtpConnection():Promise<void>{
   if(mailMode!=='smtp')throw new Error('MAIL_MODE=smtp ayarlanmalı.');
-  const client=nodemailer.createTransport({host:process.env.SMTP_HOST!,port:smtpPort,secure:smtpPort===465,requireTLS:smtpPort!==465,auth:{user:process.env.SMTP_USER!,pass:process.env.SMTP_PASSWORD!},connectionTimeout:12000,greetingTimeout:10000,socketTimeout:15000});
+  const client=smtpClient();
   await client.verify();
 }
 class MailFailure extends Error{constructor(public kind:'rejected'|'configuration'){super(kind);}}

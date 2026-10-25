@@ -23,7 +23,7 @@ React + TypeScript arayüzü, Express + TypeScript API'si ve PostgreSQL veritaba
 npm run dev
 ```
 
-Tarayıcıda `http://127.0.0.1:5173` adresini açın. Vite 5173, API 3001 kullanır. Aktarılan geliştirme şirket hesabının kimlik bilgileri değişmedi; yeni varsayılan hesap oluşturulmadı. Otomatik tarayıcı testi ayrı geçici veritabanında yapılır.
+Tarayıcıda `http://127.0.0.1:5173` adresini açın. Vite 5173, API 3001 kullanır. **`.env` değiştirildiğinde çalışan `npm run dev` sürecini tamamen durdurup yeniden başlatın.** Vite arayüzü kendi kendine yenilense de API eski SMTP ayarlarıyla çalışmaya devam edebilir. Aktarılan geliştirme şirket hesabının kimlik bilgileri değişmedi; yeni varsayılan hesap oluşturulmadı. Otomatik tarayıcı testi ayrı geçici veritabanında yapılır.
 
 ## E-posta modu ve SMTP kurulumu
 

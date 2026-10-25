@@ -3,6 +3,7 @@ import {createHmac} from 'node:crypto';
 import nodemailer from 'nodemailer';
 import {pool,transaction} from './db.ts';
 import {invitationToken} from './invitation.ts';
+import {smtpDiagnostic} from './smtp-diagnostics.ts';
 
 type MailMode='disabled'|'test'|'smtp';
 const rawMode=process.env.MAIL_MODE||'disabled';
@@ -92,7 +93,7 @@ export async function processEmailJobs():Promise<void>{
       try{const message=await messageFor(job);if(!message){status='failed';failureKind='inactive';}else await transport(message);}
       catch(error){
         if(error instanceof MailFailure){status='failed';failureKind=error.kind;}
-        else{const details=error as {code?:string;syscall?:string};status=['EAUTH','ENOAUTH','ECONFIG','EDNS','ECONNECTION','ETLS'].includes(details?.code||'')||(details?.code==='ESOCKET'&&details?.syscall==='connect')?'failed':'uncertain';failureKind=status==='failed'?'smtp_setup':'delivery_unknown';}
+        else{const details=error as {code?:string;syscall?:string};const diagnostic=smtpDiagnostic(error);console.error(`SMTP gönderim hatası: code=${diagnostic.code} responseCode=${diagnostic.responseCode??'yok'} stage=${diagnostic.stage}`);status=['EAUTH','ENOAUTH','ECONFIG','EDNS','ECONNECTION','ETLS'].includes(details?.code||'')||(details?.code==='ESOCKET'&&details?.syscall==='connect')?'failed':'uncertain';failureKind=status==='failed'?'smtp_setup':'delivery_unknown';}
       }
       await transaction(async client=>{
         await client.query("UPDATE email_jobs SET status=$2,failure_kind=$3,accepted_at=CASE WHEN $2='accepted' THEN now() ELSE accepted_at END,failed_at=CASE WHEN $2='failed' THEN now() ELSE failed_at END WHERE id=$1",[job.id,status,failureKind]);

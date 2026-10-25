@@ -1,0 +1,111 @@
+import 'dotenv/config';
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {spawn, type ChildProcessWithoutNullStreams} from 'node:child_process';
+import {randomBytes} from 'node:crypto';
+import {existsSync} from 'node:fs';
+import pg from 'pg';
+import {chromium} from 'playwright-core';
+
+const browserPath='C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
+const sourceUrl=process.env.DATABASE_URL;
+if(!sourceUrl) throw new Error('DATABASE_URL gerekli.');
+const parsed=new URL(sourceUrl);
+if(!['localhost','127.0.0.1'].includes(parsed.hostname)||process.env.NODE_ENV!=='development') throw new Error('Tarayıcı testi yalnız yerel geliştirme PostgreSQL üzerinde çalışır.');
+const databaseName=`assessora_browser_${process.pid}_${Date.now()}`;
+const testUrl=new URL(sourceUrl);testUrl.pathname=`/${databaseName}`;
+const admin=new pg.Client({connectionString:sourceUrl});
+const wait=(ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));
+function command(args:string[],env:NodeJS.ProcessEnv):Promise<string>{return new Promise((resolve,reject)=>{const child=spawn(process.execPath,['--import','tsx',...args],{env,cwd:process.cwd(),windowsHide:true});let output='';child.stdout.on('data',x=>output+=x);child.stderr.on('data',x=>output+=x);child.once('exit',code=>code===0?resolve(output):reject(new Error(output)));});}
+function service(args:string[],env:NodeJS.ProcessEnv){const child=spawn(process.execPath,args,{env,cwd:process.cwd(),windowsHide:true});let output='';child.stdout.on('data',x=>output+=x);child.stderr.on('data',x=>output+=x);return {child,getLog:()=>output};}
+async function ready(url:string){for(let i=0;i<80;i++){try{const response=await fetch(url);if(response.ok)return;}catch{}await wait(100);}throw new Error(`Servis başlamadı: ${url}`);}
+async function stop(child:ChildProcessWithoutNullStreams){if(child.exitCode!==null)return;child.kill();await new Promise<void>(resolve=>child.once('exit',()=>resolve()));}
+
+test('React arayüzünde şirket, pozisyon ve aday girişi',async()=>{
+  if(!existsSync(browserPath)) throw new Error('Microsoft Edge bulunamadı; tarayıcı testi çalıştırılamadı.');
+  const env={...process.env,DATABASE_URL:testUrl.toString(),NODE_ENV:'development',MAIL_MODE:'test',APP_PUBLIC_URL:'http://127.0.0.1:5173',API_PORT:'3001',SETUP_PASSWORD:randomBytes(18).toString('base64url')};
+  let api:ReturnType<typeof service>|undefined,web:ReturnType<typeof service>|undefined,browser:Awaited<ReturnType<typeof chromium.launch>>|undefined;
+  await admin.connect();
+  try{
+    await admin.query(`CREATE DATABASE ${databaseName}`);
+    await command(['server/migrate.ts'],env);
+    const output=await command(['server/setup.ts','company','Tarayıcı Test Şirketi','browser-admin@ornek.test'],env);
+    const organizationId=/Şirket kimliği: ([a-f0-9-]+)/.exec(output)?.[1];assert.ok(organizationId);
+    api=service(['--import','tsx','server/index.ts'],env);
+    web=service(['node_modules/vite/bin/vite.js','--host','127.0.0.1','--port','5173','--strictPort'],env);
+    await ready('http://127.0.0.1:3001/api/session');
+    await ready('http://127.0.0.1:5173/sirket/giris');
+    browser=await chromium.launch({executablePath:browserPath,headless:true});
+    const page=await browser.newPage();
+    const network:string[]=[];
+    page.on('response',response=>{if(response.url().includes('/api/')){void (async()=>{const path=new URL(response.url()).pathname;const body=path==='/api/session'&&response.ok()?await response.json().catch(()=>null):null;network.push(`${path}:${response.status()}${body?':'+body.actor:''}`);})();}});
+    await page.goto('http://127.0.0.1:5173/sirket/giris');
+    await page.getByLabel('E-posta adresi').fill('browser-admin@ornek.test');
+    await page.getByLabel('Şifre').fill(env.SETUP_PASSWORD);
+    await page.getByRole('button',{name:'Giriş yap'}).click();
+    await page.getByRole('heading',{name:'Genel bakış'}).waitFor();
+    await page.getByRole('link',{name:'Yeni pozisyon'}).click();
+    await page.getByLabel('Pozisyon başlığı').fill('Tarayıcı test pozisyonu');
+    await page.getByLabel('İş tanımı').fill('Başvuru akışını doğrulayan test pozisyonu.');
+    await page.getByLabel('1. yetkinlik').fill('TypeScript');
+    await page.getByLabel('1. ağırlık').fill('100');
+    await page.getByRole('button',{name:'Taslak oluştur'}).click();
+    await page.getByRole('heading',{name:'Tarayıcı test pozisyonu'}).waitFor();
+    const positionId=page.url().split('/').at(-1);assert.ok(positionId);
+    await page.getByRole('link',{name:'Düzenle'}).click();
+    await page.getByLabel('Durum').selectOption('active');
+    await page.getByRole('button',{name:'Kaydet'}).click();
+    await page.getByText('Aktif',{exact:true}).waitFor();
+    await page.getByRole('link',{name:'Aday ekle'}).click();
+    await page.getByLabel('Ad soyad').fill('Tarayıcı Test Adayı');
+    await page.getByLabel('E-posta adresi').fill('browser-aday@ornek.test');
+    await page.getByRole('button',{name:'Başvuru oluştur'}).click();
+    await page.getByRole('heading',{name:'Tarayıcı Test Adayı'}).waitFor();
+    const applicationId=page.url().split('/').at(-1);assert.ok(applicationId);
+    await page.getByLabel('PDF dosyası (en fazla 5 MB)').setInputFiles({name:'aday.pdf',mimeType:'application/pdf',buffer:Buffer.from('%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF')});
+    await page.getByRole('button',{name:'CV yükle'}).click();
+    await page.getByText('Yüklendi · İnceleme bekliyor. AI analizi yapılmadı.').waitFor();
+    const cv=await page.context().request.get(`http://127.0.0.1:5173/api/company/applications/${applicationId}/cv`);
+    assert.equal(cv.status(),200);assert.match(cv.headers()['content-type'],/application\/pdf/);
+    await page.getByRole('button',{name:'Davet hazırla'}).click();
+    await page.getByRole('heading',{name:'Davet önizlemesi'}).waitFor();
+    await page.getByText(/E-posta gönderimi başlatılmadı/).waitFor();
+    await page.getByRole('button',{name:'E-posta ile gönder'}).click();
+    await page.getByText(/Test taşıyıcısı kabul etti/).waitFor();
+    const testLink=await page.getByLabel('Yalnız geliştirme ortamı test bağlantısı').inputValue();assert.ok(testLink.includes('/aday/davet/'));
+    const candidateContext=await browser.newContext();
+    const candidatePage=await candidateContext.newPage();
+    await candidatePage.goto(testLink);
+    await candidatePage.getByRole('heading',{name:'Aday girişi'}).waitFor();
+    await candidatePage.getByLabel('E-posta adresi').fill('browser-aday@ornek.test');
+    await candidatePage.getByRole('button',{name:'Kod iste'}).click();
+    await candidatePage.getByRole('heading',{name:'Doğrulama kodu'}).waitFor();
+    const oldCode=await candidatePage.getByRole('status').filter({hasText:'Geliştirme kodu'}).locator('strong').innerText();
+    assert.match(oldCode,/^[0-9]{6}$/);
+    await candidatePage.getByRole('button',{name:'Kodu yeniden iste'}).click();
+    await candidatePage.waitForFunction(previous=>document.querySelector('[role="status"] strong')?.textContent!==previous,oldCode);
+    const code=await candidatePage.getByRole('status').filter({hasText:'Geliştirme kodu'}).locator('strong').innerText();
+    assert.match(code,/^[0-9]{6}$/);assert.notEqual(code,oldCode);
+    assert.ok(!api.getLog().includes(code),'Kod sunucu logunda görünmemeli.');
+    await candidatePage.getByLabel('6 haneli kod').fill(oldCode);
+    await candidatePage.getByRole('button',{name:'Doğrula'}).click();
+    await candidatePage.getByRole('alert').waitFor();
+    await candidatePage.getByLabel('6 haneli kod').fill(code);
+    await candidatePage.getByRole('button',{name:'Doğrula'}).click();
+    await candidatePage.getByRole('heading',{name:'Mülakat daveti'}).waitFor({timeout:7000});
+    await candidatePage.getByText('Tarayıcı test pozisyonu').waitFor();
+    await candidatePage.getByRole('link',{name:'Başvuru detayına dön'}).click();
+    await candidatePage.getByRole('heading',{name:'Tarayıcı test pozisyonu'}).waitFor();
+    await candidatePage.getByRole('link',{name:'Başvurularım'}).first().click();
+    await candidatePage.getByRole('heading',{name:'Başvurularım'}).waitFor();
+    await candidatePage.getByRole('link',{name:'Daveti gör'}).first().waitFor();
+    console.log('Tarayıcı: şirket girişi, pozisyon, aday/CV, manuel davet ve kodlu aday paneli geçti.');
+    await candidateContext.close();
+  }finally{
+    if(browser) await browser.close();
+    if(web) await stop(web.child);
+    if(api) await stop(api.child);
+    await admin.query(`DROP DATABASE IF EXISTS ${databaseName} WITH (FORCE)`);
+    await admin.end();
+  }
+});

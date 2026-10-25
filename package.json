@@ -1,0 +1,46 @@
+{
+  "name": "assessora",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "tsx watch server/index.ts",
+    "dev:web": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "start": "tsx server/index.ts",
+    "migrate": "tsx server/migrate.ts",
+    "mail:check": "tsx server/mail-check.ts",
+    "setup": "tsx server/setup.ts",
+    "import:sqlite": "tsx server/import-sqlite.ts",
+    "test": "tsx --test server/*.test.ts",
+    "test:integration": "tsx --test integration/postgres.test.ts integration/stage2.test.ts integration/email.test.ts",
+    "test:browser": "tsx --test integration/browser.test.ts"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "multer": "^2.5.0",
+    "nodemailer": "^10.2.1",
+    "pg": "^8.16.3",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-router-dom": "^7.9.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.4",
+    "@types/multer": "^2.3.0",
+    "@types/node": "^22.15.0",
+    "@types/nodemailer": "^8.0.2",
+    "@types/pg": "^8.15.5",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "@vitejs/plugin-react": "^5.1.0",
+    "better-sqlite3": "^12.4.1",
+    "concurrently": "^9.2.1",
+    "playwright-core": "^1.64.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.12"
+  }
+}

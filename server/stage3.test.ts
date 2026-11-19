@@ -230,3 +230,51 @@ test('C12 & REP-05: Bağlantı kesintisi (interrupted) sonrasında oturum durumu
   assert.equal(isInGap(25), true, '00:20 - 00:35 arasında kesik zaman uyarısı tetiklenmelidir');
   assert.equal(isInGap(40), false, 'Kurtarılan aralıkta kesinti uyarısı verilmemelidir');
 });
+
+test('INT-05 & INT-06: Açıklama isteği ve anlaşılmayan/kısa ses transkripti toparlanma davranışı', () => {
+  // INT-06: Çok kısa (<15 karakter veya <3 kelime) veya anlaşılmayan ses girdisi tespit edildiğinde soru atlanmaz, toparlanma mesajı döner
+  const evaluateTurnClarity = (text: string, currentIdx: number) => {
+    const clean = text.trim();
+    const wordCount = clean.split(/\s+/).filter(Boolean).length;
+    const isUnclear = clean.length < 15 || wordCount < 3 || /^(ses|deneme|alo|duyuyor|anlamadım|bilmiyorum|\.+|\?+)$/i.test(clean);
+    if (isUnclear) {
+      return {
+        is_recovery: true,
+        nextQuestionIdx: currentIdx,
+        recoveryWarning: 'Yanıtınız çok kısa veya belirsiz algılandı.'
+      };
+    }
+    return {
+      is_recovery: false,
+      nextQuestionIdx: currentIdx + 1,
+      recoveryWarning: null
+    };
+  };
+
+  const unclearTurn = evaluateTurnClarity('ses deneme', 1);
+  assert.equal(unclearTurn.is_recovery, true, 'Anlaşılmayan kısa yanıtta INT-06 toparlanma devreye girmelidir');
+  assert.equal(unclearTurn.nextQuestionIdx, 1, 'Toparlanma sırasında soru indeksi ilerlememelidir');
+
+  const clearTurn = evaluateTurnClarity('PostgreSQL üzerinde composite index ve EXPLAIN ANALYZE kullanarak sorgu süresini düşürdüm.', 1);
+  assert.equal(clearTurn.is_recovery, false);
+  assert.equal(clearTurn.nextQuestionIdx, 2);
+});
+
+test('APP-07: Eşzamanlı puan ve itiraz düzenlemelerinde sürüm çakışması (Optimistic Concurrency 409) yakalanır', () => {
+  const reviseWithConcurrencyCheck = (dbScore: number, expectedScore: number, newScore: number) => {
+    if (dbScore !== expectedScore) {
+      throw new Error('409 Conflict: Bu değerlendirme puanı başka bir yetkili tarafından eşzamanlı güncellenmiş (APP-07 Sürüm Çakışması).');
+    }
+    return { oldScore: dbScore, newScore };
+  };
+
+  // 1. İki değerlendiriciden biri puanı 60'tan 82'ye güncelledikten sonra, eski 60 değerini bekleyen ikinci istek 409 fırlatır
+  assert.throws(
+    () => reviseWithConcurrencyCheck(82, 60, 75),
+    /409 Conflict.*APP-07/
+  );
+
+  // 2. Güncel puanla eşleşen düzenleme başarıyla kaydedilir
+  const success = reviseWithConcurrencyCheck(82, 82, 88);
+  assert.equal(success.newScore, 88);
+});

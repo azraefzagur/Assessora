@@ -45,13 +45,18 @@ export function registerStage2(app:Express,company:(roles?:Membership['role'][])
     if(positionId&&!uuidPattern.test(positionId)) throw new ValidationError('Pozisyon kimliği geçersiz.');
     const {rows}=await pool.query(`SELECT a.id,a.candidate_name,c.email,p.title AS position_title,p.id AS position_id,a.status,a.created_at,
       cv.id IS NOT NULL AS has_cv,
-      cva.match_status, cva.summary AS cv_summary,
+      cva.match_status, cva.match_status AS cv_match_status, cva.summary AS cv_summary, cva.criteria_matches, cva.analyzed_at,
       EXISTS (SELECT 1 FROM invitations i WHERE i.application_id=a.id AND i.status='prepared' AND i.expires_at>now()) AS has_open_invitation
       FROM applications a JOIN candidates c ON c.id=a.candidate_id JOIN positions p ON p.id=a.position_id AND p.organization_id=a.organization_id
       LEFT JOIN cv_documents cv ON cv.application_id=a.id AND cv.organization_id=a.organization_id
       LEFT JOIN cv_analyses cva ON cva.application_id=a.id
       WHERE a.organization_id=$1 AND ($2::uuid IS NULL OR a.position_id=$2) ORDER BY a.created_at DESC`,[req.session.organization_id,positionId]);
-    res.json({applications:rows,role:req.membership?.role});
+    const enriched=rows.map(r=>{
+      const matches=Array.isArray(r.criteria_matches)?r.criteria_matches:[];
+      const pct=matches.length>0?Math.round(matches.reduce((acc:number,m:any)=>acc+(m.match_level==='full'?100:m.match_level==='partial'?55:0),0)/matches.length):(r.match_status==='suitable'?88:r.match_status==='needs_review'?58:r.match_status==='unsuitable'?25:null);
+      return {...r,cv_match_percentage:pct};
+    });
+    res.json({applications:enriched,role:req.membership?.role});
   }));
   app.post('/api/company/applications',company(['admin','recruiter']),route(async(req,res)=>{
     const input=parseApplication(req.body),org=req.session.organization_id!;
@@ -70,7 +75,7 @@ export function registerStage2(app:Express,company:(roles?:Membership['role'][])
   }));
   app.get('/api/company/applications/:id',company(),route(async(req,res)=>{
     const id=req.params.id;if(typeof id!=='string'||!uuidPattern.test(id)) throw new HttpError(404,'Başvuru bulunamadı.');
-    const {rows}=await pool.query(`SELECT a.id,a.candidate_name,c.email,a.status,a.created_at,a.position_version,p.id AS position_id,p.title AS position_title,p.status AS position_status,
+    const {rows}=await pool.query(`SELECT a.id,a.candidate_name,c.email,c.email AS candidate_email,a.status,a.created_at,a.position_version,p.id AS position_id,p.title AS position_title,p.status AS position_status,
       cv.id AS cv_id,cv.original_filename AS cv_name,cv.size_bytes AS cv_size,cv.review_status AS cv_review_status,
       i.id AS invitation_id,i.status AS invitation_status,i.delivery_status,i.estimated_minutes,i.expires_at
       FROM applications a JOIN candidates c ON c.id=a.candidate_id JOIN positions p ON p.id=a.position_id AND p.organization_id=a.organization_id
@@ -79,7 +84,40 @@ export function registerStage2(app:Express,company:(roles?:Membership['role'][])
       WHERE a.id=$1 AND a.organization_id=$2`,[id,req.session.organization_id]);
     if(!rows[0]) throw new HttpError(404,'Başvuru bulunamadı.');
     const row=rows[0];
-    res.json({...row,invitation_status:row.invitation_id?invitationState({status:row.invitation_status,expires_at:row.expires_at}):null,test_link:row.invitation_id&&row.invitation_status==='prepared'&&new Date(row.expires_at).getTime()>Date.now()?devPath(row.invitation_id):null,mail_mode:mailMode,role:req.membership?.role});
+    const [reqsRes,cvaRes]=await Promise.all([
+      pool.query('SELECT id,label,required,weight,sort_order FROM position_requirements WHERE position_id=$1 AND version_no=$2 ORDER BY sort_order ASC',[row.position_id,row.position_version]),
+      pool.query('SELECT * FROM cv_analyses WHERE application_id=$1 ORDER BY analyzed_at DESC LIMIT 1',[id])
+    ]);
+    res.json({...row,requirements:reqsRes.rows,cv_analysis:cvaRes.rows[0]||null,invitation_status:row.invitation_id?invitationState({status:row.invitation_status,expires_at:row.expires_at}):null,test_link:row.invitation_id&&row.invitation_status==='prepared'&&new Date(row.expires_at).getTime()>Date.now()?devPath(row.invitation_id):null,mail_mode:mailMode,role:req.membership?.role});
+  }));
+  app.post('/api/company/applications/:id/status',company(['admin','recruiter','reviewer']),route(async(req,res)=>{
+    const id=req.params.id;if(typeof id!=='string'||!uuidPattern.test(id)) throw new HttpError(404,'Başvuru bulunamadı.');
+    const rawStatus=String(req.body?.status||'').trim();
+    const cvMatchStatus=req.body?.cvMatchStatus;
+    const statusMap:Record<string,string>={
+      shortlisted:'review',
+      human_review:'human_review',
+      review:'review',
+      rejected:'completed',
+      completed:'completed',
+      invited:'invited',
+      created:'created'
+    };
+    const nextStatus=statusMap[rawStatus];
+    if(!nextStatus) throw new ValidationError('Geçersiz başvuru durumu.');
+    const org=req.session.organization_id!;
+    const updated=await pool.query('UPDATE applications SET status=$1 WHERE id=$2 AND organization_id=$3 RETURNING id,status',[nextStatus,id,org]);
+    if(!updated.rows[0]) throw new HttpError(404,'Başvuru bulunamadı.');
+    if(cvMatchStatus&&['suitable','needs_review','unsuitable'].includes(cvMatchStatus)){
+      await pool.query('UPDATE cv_analyses SET match_status=$1 WHERE application_id=$2 AND organization_id=$3',[cvMatchStatus,id,org]);
+    } else if(rawStatus==='shortlisted'){
+      await pool.query("UPDATE cv_analyses SET match_status='suitable' WHERE application_id=$1 AND organization_id=$2",[id,org]);
+    } else if(rawStatus==='human_review'){
+      await pool.query("UPDATE cv_analyses SET match_status='needs_review' WHERE application_id=$1 AND organization_id=$2",[id,org]);
+    } else if(rawStatus==='rejected'){
+      await pool.query("UPDATE cv_analyses SET match_status='unsuitable' WHERE application_id=$1 AND organization_id=$2",[id,org]);
+    }
+    res.json({ok:true,id,status:nextStatus});
   }));
   app.post('/api/company/applications/:id/cv',company(['admin','recruiter']),upload,route(async(req,res)=>{
     const id=req.params.id,file=req.file;
@@ -173,11 +211,13 @@ export function registerStage2(app:Express,company:(roles?:Membership['role'][])
     const id=req.params.id;if(typeof id!=='string'||!uuidPattern.test(id)) throw new HttpError(404,'Başvuru bulunamadı.');
     const {rows}=await pool.query(`SELECT a.id,a.status,a.created_at,a.position_version,a.candidate_name,p.title AS position_title,o.name AS organization_name,
       cv.id IS NOT NULL AS has_cv,i.id AS invitation_id,i.estimated_minutes,i.expires_at,
+      s.status AS session_status, s.duration_seconds, s.started_at, s.completed_at,
       row_to_json(ap.*) AS appeal
       FROM applications a JOIN positions p ON p.id=a.position_id AND p.organization_id=a.organization_id JOIN organizations o ON o.id=a.organization_id
       LEFT JOIN cv_documents cv ON cv.application_id=a.id AND cv.organization_id=a.organization_id
+      LEFT JOIN interview_sessions s ON s.application_id=a.id
       LEFT JOIN LATERAL (SELECT * FROM invitations WHERE application_id=a.id AND status='prepared' AND expires_at>now() ORDER BY created_at DESC LIMIT 1) i ON true
-      LEFT JOIN LATERAL (SELECT id, status, reason, timestamp_reference, reviewer_notes, created_at FROM appeals WHERE application_id=a.id ORDER BY created_at DESC LIMIT 1) ap ON true
+      LEFT JOIN LATERAL (SELECT id, status, reason, timestamp_reference, decision, decision_note, decision_note AS reviewer_notes, decided_at, created_at FROM appeals WHERE application_id=a.id ORDER BY created_at DESC LIMIT 1) ap ON true
       WHERE a.id=$1 AND a.candidate_id=$2`,[id,req.session.actor_id]);
     if(!rows[0]) throw new HttpError(404,'Başvuru bulunamadı.');
     const item=rows[0];res.json({...item,invitation_path:item.invitation_id?`/aday/davet/${invitationToken(item.invitation_id)}`:null});

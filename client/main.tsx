@@ -109,7 +109,13 @@ function Login({ kind, csrf, refresh, mailMode }: { kind: 'company' | 'candidate
     event.preventDefault(); setBusy(true); setError('');
     try {
       if (company) { await request('/api/company/login', csrf, { email, password }); await refresh(); navigate('/sirket'); }
-      else { const result = await request<{ developmentCode?: string }>('/api/candidate/code/request', csrf, { email }); sessionStorage.setItem('candidate_email', email); navigate('/aday/dogrula', { state: { developmentCode: result.developmentCode } }); }
+      else {
+        const result = await request<{ developmentCode?: string }>('/api/candidate/code/request', csrf, { email });
+        sessionStorage.setItem('candidate_email', email);
+        if (result.developmentCode) sessionStorage.setItem('candidate_dev_code', result.developmentCode);
+        else sessionStorage.removeItem('candidate_dev_code');
+        navigate('/aday/dogrula', { state: { developmentCode: result.developmentCode } });
+      }
     } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   }
   return (
@@ -123,17 +129,44 @@ function Login({ kind, csrf, refresh, mailMode }: { kind: 'company' | 'candidate
         <div className="auth-box">
           <div className="card">
             <h2>{company ? 'Şirket hesabı' : 'Aday girişi'}</h2>
-            <p className="muted">{company ? 'Kurumsal e-postanız ve şifrenizle devam edin.' : mailMode === 'test' ? 'Yerel test modunda kod sonraki ekranda gösterilir; gerçek e-posta gönderilmez.' : mailMode === 'smtp' ? 'Kayıtlı adresinize gönderilecek kodla giriş yapın.' : 'E-posta gönderimi henüz yapılandırılmadı.'}</p>
+            <p className="muted">{company ? 'Kurumsal e-postanız ve şifrenizle devam edin.' : mailMode === 'test' ? 'Yerel test modunda doğrulama kodu sonraki ekranda anında gösterilir ve tek tıkla doldurulabilir.' : mailMode === 'smtp' ? 'Kayıtlı adresinize gönderilecek kodla giriş yapın.' : 'E-posta gönderimi henüz yapılandırılmadı.'}</p>
             {error && <div className="error" role="alert">{error}</div>}
             <form onSubmit={submit}>
               <label htmlFor="email">E-posta adresi</label>
-              <input id="email" type="email" value={email} onChange={e => setEmail(e.target.value)} autoComplete="email" required />
+              <input id="email" type="email" value={email} onChange={e => setEmail(e.target.value)} autoComplete="email" placeholder={company ? 'yonetici@ornek.local' : 'ornek@eposta.com'} required />
               {company && <>
                 <label htmlFor="password">Şifre</label>
                 <input id="password" type="password" value={password} onChange={e => setPassword(e.target.value)} autoComplete="current-password" required />
               </>}
-              <button className="button" disabled={busy || (!company && mailMode === 'disabled')}>{company ? 'Giriş yap' : 'Kod iste'}</button>
+              <button className="button" disabled={busy || (!company && mailMode === 'disabled')}>{company ? 'Giriş yap' : 'Doğrulama kodu gönder'}</button>
             </form>
+
+            {!company && (
+              <div style={{ marginTop: '16px', paddingTop: '12px', borderTop: '1px solid #e2e8f0', textAlign: 'left' }}>
+                <div className="muted" style={{ fontSize: '11px', marginBottom: '6px', fontWeight: 600 }}>
+                  ⚡ Hızlı Demo Aday Seçimi (veya kendi e-postanızı yazabilirsiniz):
+                </div>
+                <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                  {[
+                    { label: 'Ahmet (76.0)', mail: 'ahmet.yilmaz@example.com' },
+                    { label: 'Zeynep (75.5)', mail: 'zeynep.kaya@example.com' },
+                    { label: 'Ece (İtiraz)', mail: 'ece.celik@example.com' },
+                    { label: 'Burak (Kesinti C12)', mail: 'burak.demir@example.com' },
+                    { label: 'Selin (Eksik Kanıt)', mail: 'selin.arslan@example.com' }
+                  ].map(demo => (
+                    <button
+                      key={demo.mail}
+                      type="button"
+                      className="button secondary"
+                      style={{ fontSize: '11px', padding: '4px 8px' }}
+                      onClick={() => setEmail(demo.mail)}
+                    >
+                      {demo.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
           <p><Link to={company ? '/aday/giris' : '/sirket/giris'}>{company ? 'Aday girişi →' : '← Şirket girişi'}</Link></p>
         </div>
@@ -144,14 +177,16 @@ function Login({ kind, csrf, refresh, mailMode }: { kind: 'company' | 'candidate
 
 function CandidateVerify({ csrf }: { csrf: string; refresh: () => Promise<void> }) {
   const location = useLocation();
-  const [developmentCode, setDevelopmentCode] = useState((location.state as { developmentCode?: string } | null)?.developmentCode);
+  const initialCode = (location.state as { developmentCode?: string } | null)?.developmentCode || sessionStorage.getItem('candidate_dev_code') || undefined;
+  const [developmentCode, setDevelopmentCode] = useState<string | undefined>(initialCode);
   const email = sessionStorage.getItem('candidate_email') || '';
   const [digits, setDigits] = useState<string[]>(['', '', '', '', '', '']);
   const [error, setError] = useState('');
   const [info, setInfo] = useState('');
   const [busy, setBusy] = useState(false);
-  const [countdown, setCountdown] = useState(45);
+  const [countdown, setCountdown] = useState(15);
   const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
+  const autoRequestedRef = useRef(false);
 
   useEffect(() => {
     if (countdown > 0) {
@@ -163,6 +198,21 @@ function CandidateVerify({ csrf }: { csrf: string; refresh: () => Promise<void> 
   useEffect(() => {
     inputRefs.current[0]?.focus();
   }, []);
+
+  // Eğer sayfada henüz kod yoksa (ör. sayfa yenilendiyse veya yeni aday kaydıysa) otomatik olarak kodu üret ve ekranda göster
+  useEffect(() => {
+    if (!email || developmentCode || !csrf) return;
+    let cancelled = false;
+    request<{ message: string; developmentCode?: string }>('/api/candidate/code/request', csrf, { email })
+      .then(res => {
+        if (!cancelled && res.developmentCode) {
+          setDevelopmentCode(res.developmentCode);
+          sessionStorage.setItem('candidate_dev_code', res.developmentCode);
+        }
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [email, developmentCode, csrf]);
 
   if (!email) return <Navigate to="/aday/giris" />;
 
@@ -228,6 +278,7 @@ function CandidateVerify({ csrf }: { csrf: string; refresh: () => Promise<void> 
     try {
       await request('/api/candidate/code/verify', csrf, { email, code });
       sessionStorage.removeItem('candidate_email');
+      sessionStorage.removeItem('candidate_dev_code');
       const next = sessionStorage.getItem('candidate_return_to') || '/aday';
       sessionStorage.removeItem('candidate_return_to');
       window.location.replace(next);
@@ -245,9 +296,10 @@ function CandidateVerify({ csrf }: { csrf: string; refresh: () => Promise<void> 
     try {
       const result = await request<{ message: string; developmentCode?: string }>('/api/candidate/code/request', csrf, { email });
       setDevelopmentCode(result.developmentCode);
+      if (result.developmentCode) sessionStorage.setItem('candidate_dev_code', result.developmentCode);
       setDigits(['', '', '', '', '', '']);
       setInfo(result.message);
-      setCountdown(45);
+      setCountdown(15);
       inputRefs.current[0]?.focus();
     } catch (e) {
       setError((e as Error).message);
@@ -279,10 +331,20 @@ function CandidateVerify({ csrf }: { csrf: string; refresh: () => Promise<void> 
             </p>
 
             {developmentCode && (
-              <p className="notice" role="status" style={{ textAlign: 'left' }}>
-                🔑 Geliştirme Test Kodu: <strong>{developmentCode}</strong><br />
-                <small className="muted">10 dakika geçerlidir ve tek kullanımlıktır.</small>
-              </p>
+              <div className="notice" role="status" style={{ textAlign: 'left', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                <div>
+                  🔑 Doğrulama Kodunuz: <strong style={{ fontSize: '16px', letterSpacing: '2px' }}>{developmentCode}</strong><br />
+                  <small className="muted">10 dakika geçerlidir ve tek kullanımlıktır.</small>
+                </div>
+                <button
+                  type="button"
+                  className="button secondary"
+                  style={{ fontSize: '12px', padding: '6px 10px' }}
+                  onClick={() => setDigits(developmentCode.slice(0, 6).split(''))}
+                >
+                  ✨ Kodu Otomatik Doldur
+                </button>
+              </div>
             )}
 
             {info && <p className="notice" role="status">{info}</p>}
@@ -1631,6 +1693,8 @@ function CandidateInterviewRoom({ csrf }: { csrf: string }) {
   const [explanationText, setExplanationText] = useState('');
   const [consoleOutput, setConsoleOutput] = useState('');
   const [executing, setExecuting] = useState(false);
+  const [clarificationHelp, setClarificationHelp] = useState('');
+  const [recoveryNotice, setRecoveryNotice] = useState('');
 
   // INT-07: Canlı Kalan Süre Sayacı
   const [remainingSeconds, setRemainingSeconds] = useState<number>(1800);
@@ -1664,8 +1728,12 @@ function CandidateInterviewRoom({ csrf }: { csrf: string }) {
     }
   };
 
-  // Ses Tanıma (Speech-to-Text - Web Speech API)
+  // Ses Tanıma (Speech-to-Text - Web Speech API) + INT-06 Aday Konuşurken AI Sesini Kesme (Barge-in)
   const toggleListening = () => {
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window && window.speechSynthesis.speaking) {
+      window.speechSynthesis.cancel();
+      setIsSpeakingAi(false);
+    }
     const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SpeechRec) {
       alert('Tarayıcınızda ses tanıma desteklenmiyor veya engelli. Lütfen Chrome/Edge kullanın veya klavyeden yazın.');
@@ -1846,6 +1914,7 @@ function CandidateInterviewRoom({ csrf }: { csrf: string }) {
     if (isListening) toggleListening();
     setBusy(true);
     setError('');
+    setClarificationHelp('');
     try {
       const res = await request<any>('/api/candidate/interview/turn', csrf, {
         sessionId: sessionData.session.id,
@@ -1855,6 +1924,7 @@ function CandidateInterviewRoom({ csrf }: { csrf: string }) {
       setTurns(prev => [...prev, res.candidateTurn, ...(res.nextAiTurn ? [res.nextAiTurn] : [])]);
       setCandidateInput('');
       setCurrentQIndex(res.currentQuestionIndex);
+      setRecoveryNotice(res.recoveryWarning || '');
       if (res.isCompleted) {
         speakAi('Mülakatımızın soru-cevap bölümü tamamlandı. Şimdi uygulamalı görev ekranına geçebilirsiniz.');
         setTimeout(() => advanceStep('task'), 3500);
@@ -2092,11 +2162,14 @@ function CandidateInterviewRoom({ csrf }: { csrf: string }) {
                   try {
                     const res = await request<any>('/api/candidate/interview/clarify', csrf, {
                       sessionId: sessionData.session.id,
-                      questionIndex: currentQIndex
+                      currentQuestionIndex: currentQIndex
                     });
-                    speakAi(res.clarification);
+                    const txt = res.clarificationText || res.clarification || '';
+                    setClarificationHelp(txt);
+                    speakAi(txt);
                   } catch {
                     const explain = `Bu soruda ${sessionData.questions[currentQIndex]?.requirement_label} yetkinliğinizle ilgili karşılaştığınız mimari ve teknik zorlukları nasıl çözdüğünüzü duymak istiyoruz.`;
+                    setClarificationHelp(explain);
                     speakAi(explain);
                   }
                 }}>
@@ -2110,9 +2183,21 @@ function CandidateInterviewRoom({ csrf }: { csrf: string }) {
               {sessionData.questions[currentQIndex]?.question_text}
             </div>
 
+            {clarificationHelp && (
+              <div style={{ marginTop: '10px', padding: '10px 14px', background: '#f0f9ff', border: '1px solid #bae6fd', borderRadius: '8px', fontSize: '13px', color: '#0369a1' }}>
+                <strong>💡 Soru Açıklaması (INT-05):</strong> {clarificationHelp}
+              </div>
+            )}
+
+            {recoveryNotice && (
+              <div style={{ marginTop: '10px', padding: '10px 14px', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: '8px', fontSize: '13px', color: '#92400e' }}>
+                <strong>⚠️ Ses & Transkript Toparlanma (INT-06):</strong> {recoveryNotice}
+              </div>
+            )}
+
             {/* Sesle Konuşma veya Yazma Alanı */}
             <div style={{ marginTop: '16px' }}>
-              <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '8px' }}>
+              <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap' }}>
                 <button
                   type="button"
                   className="button"
@@ -2131,6 +2216,20 @@ function CandidateInterviewRoom({ csrf }: { csrf: string }) {
                     <>🎙️ Mikrofonla Sesli Yanıtla</>
                   )}
                 </button>
+                {candidateInput && (
+                  <button
+                    type="button"
+                    className="button secondary"
+                    style={{ fontSize: '12px', padding: '6px 12px' }}
+                    onClick={() => {
+                      if (isListening) toggleListening();
+                      setCandidateInput('');
+                    }}
+                    title="Yanlış ses tanıması durumunda transkripti sıfırlayıp tekrar konuşun (INT-06)"
+                  >
+                    🔄 Transkripti Temizle / Yeniden Kaydet (INT-06)
+                  </button>
+                )}
                 <span className="muted" style={{ fontSize: '13px' }}>veya cevabınızı klavyeden yazıp düzenleyin:</span>
               </div>
 
@@ -2457,9 +2556,9 @@ function CandidateApplicationDetail({ csrf }: { csrf: string }) {
           <p><strong>İtiraz Gerekçeniz:</strong> {data.appeal.reason}</p>
           <p><strong>Referans Dakika:</strong> {data.appeal.timestamp_reference || 'Belirtilmedi'}</p>
           <p><strong>Değerlendirme Durumu:</strong> <span className="badge">{statusLabel(data.appeal.status)}</span></p>
-          {data.appeal.reviewer_notes && (
+          {(data.appeal.decision_note || data.appeal.reviewer_notes) && (
             <p style={{ marginTop: '8px', padding: '10px', background: '#fff', borderRadius: '6px', border: '1px solid #fed7aa', color: '#0369a1' }}>
-              <strong>İnceleme Heyeti Kararı:</strong> {data.appeal.reviewer_notes}
+              <strong>İnceleme Heyeti Kararı ({statusLabel(data.appeal.decision || '')}):</strong> {data.appeal.decision_note || data.appeal.reviewer_notes}
             </p>
           )}
         </div>
@@ -2468,25 +2567,32 @@ function CandidateApplicationDetail({ csrf }: { csrf: string }) {
       {/* C11 İtiraz Modalı */}
       {showAppealModal && (
         <div className="modal-overlay">
-          <div className="modal-content">
-            <h2>Gerekçeli İtiraz Başvurusu</h2>
-            <p className="muted">Değerlendirmede adil olmadığını düşündüğünüz hususları ve video/transkript dakika referansını belirtin.</p>
+          <div className="modal-content" style={{ maxWidth: '640px' }}>
+            <h2>Gerekçeli İtiraz Başvurusu (C11)</h2>
+            <p className="muted">Mülakat sürecine veya değerlendirmeye ilişkin bir konuda itirazda bulunabilirsiniz.</p>
+            <div style={{ padding: '12px', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '6px', marginBottom: '14px', fontSize: '13px', color: '#334155' }}>
+              <strong>ℹ️ Başvurunuz nasıl değerlendirilecek?</strong>
+              <p style={{ margin: '4px 0 0' }}>
+                İtiraz başvurunuz şirketin yetkili insan değerlendirici ekibi tarafından incelenir. Belirttiğiniz zaman damgasına ait mülakat kayıtları ve transkript dökümü tekrar gözden geçirilir; sonuç hakkında size bildirim yapılır.
+              </p>
+            </div>
             <form onSubmit={submitAppeal}>
-              <label htmlFor="appeal-reason">İtiraz Gerekçesi (En az 10 karakter):</label>
+              <label htmlFor="appeal-reason">İtiraz Nedeni * (En az 10 karakter):</label>
               <textarea
                 id="appeal-reason"
                 required
                 minLength={10}
                 rows={4}
+                placeholder="Lütfen itiraz nedeninizi ve hangi sorudaki cevabınızın yeniden incelenmesini istediğinizi detaylı olarak açıklayın..."
                 value={appealReason}
                 onChange={e => setAppealReason(e.target.value)}
                 style={{ width: '100%', borderRadius: '6px', padding: '10px', border: '1px solid #cbd5e1' }}
               />
-              <label htmlFor="timestamp-ref" style={{ marginTop: '12px', display: 'block' }}>İlgili Görüşme Zamanı (Opsiyonel, örn: 00:08:45):</label>
+              <label htmlFor="timestamp-ref" style={{ marginTop: '12px', display: 'block' }}>İlgili Zaman Bilgisi (İsteğe bağlı, Örn: 00:12:34):</label>
               <input
                 id="timestamp-ref"
                 type="text"
-                placeholder="00:12:30"
+                placeholder="00:12:34"
                 value={timestampRef}
                 onChange={e => setTimestampRef(e.target.value)}
                 style={{ width: '100%', borderRadius: '6px', padding: '8px', border: '1px solid #cbd5e1' }}
@@ -2679,6 +2785,7 @@ function CompanyReportView({ csrf }: { csrf: string }) {
   const [revisingAssessment, setRevisingAssessment] = useState<any>(null);
   const [newScore, setNewScore] = useState<number>(80);
   const [revisionNote, setRevisionNote] = useState('');
+  const [transcriptQuery, setTranscriptQuery] = useState('');
   const [busy, setBusy] = useState(false);
 
   const reload = () => request<any>(`/api/company/applications/${id}/report`).then(setData);
@@ -2688,8 +2795,14 @@ function CompanyReportView({ csrf }: { csrf: string }) {
     e.preventDefault();
     setBusy(true);
     try {
-      await request(`/api/company/assessments/${revisingAssessment.id}/revise`, csrf, { newScore, revisionNote });
+      await request(`/api/company/assessments/${revisingAssessment.id}/revise`, csrf, {
+        newScore,
+        revisionNote,
+        expectedScore: revisingAssessment.score,
+        expectedRevisedAt: revisingAssessment.revised_at
+      });
       setRevisingAssessment(null);
+      setRevisionNote('');
       await reload();
     } catch (err) {
       alert((err as Error).message);
@@ -2886,34 +2999,42 @@ function CompanyReportView({ csrf }: { csrf: string }) {
           </div>
 
           <div className="card">
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px', flexWrap: 'wrap', gap: '8px' }}>
               <h2 style={{ margin: 0 }}>Konuşma Transkripti ({data.turns?.length || 0} Tur)</h2>
-              <span className="muted" style={{ fontSize: '12px' }}>💡 Zaman damgasına tıklayarak videoda o saniyeye atlayabilirsiniz (AC-10)</span>
+              <input
+                type="search"
+                placeholder="🔍 Konuşmada ara..."
+                value={transcriptQuery}
+                onChange={e => setTranscriptQuery(e.target.value)}
+                style={{ padding: '6px 10px', borderRadius: '6px', border: '1px solid #cbd5e1', fontSize: '12px', width: '210px' }}
+              />
             </div>
 
             <div className="chat-flow" style={{ maxHeight: '380px' }}>
-              {data.turns?.map((t: any) => {
-                const isTurnActive = videoTime >= (t.audio_timestamp_start || 0) && videoTime <= (t.audio_timestamp_end || 999);
-                return (
-                  <div key={t.id} className={`turn ${t.speaker} ${isTurnActive ? 'active-turn' : ''}`}>
-                    <div className="turn-meta">
-                      <strong>{t.speaker === 'ai' ? '🤖 AI Mülakatçı' : `👤 ${data.application.candidate_name}`}</strong>
-                      <button
-                        type="button"
-                        className="timestamp-btn"
-                        onClick={() => {
-                          setVideoTime(t.audio_timestamp_start || 0);
-                          setIsPlaying(true);
-                        }}
-                        title="Bu konuşma anına videoda atla"
-                      >
-                        ⏱️ {formatSec(t.audio_timestamp_start || 0)} - {formatSec(t.audio_timestamp_end || 0)}
-                      </button>
+              {data.turns
+                ?.filter((t: any) => !transcriptQuery.trim() || String(t.transcript_text || '').toLowerCase().includes(transcriptQuery.toLowerCase()))
+                .map((t: any) => {
+                  const isTurnActive = videoTime >= (t.audio_timestamp_start || 0) && videoTime <= (t.audio_timestamp_end || 999);
+                  return (
+                    <div key={t.id} className={`turn ${t.speaker} ${isTurnActive ? 'active-turn' : ''}`}>
+                      <div className="turn-meta">
+                        <strong>{t.speaker === 'ai' ? '🤖 AI Mülakatçı' : `👤 ${data.application.candidate_name}`}</strong>
+                        <button
+                          type="button"
+                          className="timestamp-btn"
+                          onClick={() => {
+                            setVideoTime(t.audio_timestamp_start || 0);
+                            setIsPlaying(true);
+                          }}
+                          title="Bu konuşma anına videoda atla"
+                        >
+                          ⏱️ {formatSec(t.audio_timestamp_start || 0)} - {formatSec(t.audio_timestamp_end || 0)}
+                        </button>
+                      </div>
+                      {t.transcript_text}
                     </div>
-                    {t.transcript_text}
-                  </div>
-                );
-              })}
+                  );
+                })}
             </div>
           </div>
 
@@ -2935,20 +3056,24 @@ function CompanyReportView({ csrf }: { csrf: string }) {
           {data.cv_analysis && (
             <div className="card" style={{ marginBottom: '16px', background: '#f8fafc', border: '1px solid #e2e8f0' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-                <h3 style={{ margin: 0, fontSize: '15px' }}>📄 CV Ön Değerlendirme Analizi</h3>
-                <span className={`badge ${data.cv_analysis.match_status === 'matched' ? 'active' : data.cv_analysis.match_status === 'borderline' ? 'warning' : 'rejected'}`}>
-                  {data.cv_analysis.match_status === 'matched' ? '✓ Eşleşti' : data.cv_analysis.match_status === 'borderline' ? '⚠️ Sınırda' : '✕ Eşleşmedi'} (%{data.cv_analysis.match_percentage || 0})
+                <h3 style={{ margin: 0, fontSize: '15px' }}>📄 CV Ön Değerlendirme Analizi (B05)</h3>
+                <span className={`badge ${['suitable', 'matched'].includes(data.cv_analysis.match_status) ? 'active' : ['needs_review', 'borderline'].includes(data.cv_analysis.match_status) ? 'warning' : 'rejected'}`}>
+                  {['suitable', 'matched'].includes(data.cv_analysis.match_status)
+                    ? '✓ Uygun'
+                    : ['needs_review', 'borderline'].includes(data.cv_analysis.match_status)
+                      ? '⚠️ İnsan İncelemesi'
+                      : '✕ Kriterleri Karşılamıyor'}
                 </span>
               </div>
               <p style={{ margin: '0 0 8px', fontSize: '13px', color: '#334155' }}>{data.cv_analysis.summary}</p>
-              {data.cv_analysis.strengths?.length > 0 && (
+              {data.cv_analysis.extracted_skills?.length > 0 && (
                 <div style={{ fontSize: '12px', color: '#15803d', marginBottom: '4px' }}>
-                  <strong>✓ Güçlü Yönler:</strong> {data.cv_analysis.strengths.join(', ')}
+                  <strong>✓ Tespit Edilen Beceriler:</strong> {data.cv_analysis.extracted_skills.join(', ')}
                 </div>
               )}
-              {data.cv_analysis.gaps?.length > 0 && (
-                <div style={{ fontSize: '12px', color: '#b91c1c' }}>
-                  <strong>⚠️ Eksik Noktalar:</strong> {data.cv_analysis.gaps.join(', ')}
+              {data.cv_analysis.limitations && (
+                <div style={{ fontSize: '12px', color: '#b45309' }}>
+                  <strong>⚠️ Sınırlılıklar / Not:</strong> {data.cv_analysis.limitations}
                 </div>
               )}
             </div>
@@ -2956,32 +3081,72 @@ function CompanyReportView({ csrf }: { csrf: string }) {
 
           <div className="card">
             <h2>Yetkinlik Değerlendirmeleri (Kanıtlı)</h2>
-            {reqAssessments?.map((asm: any) => (
-              <div key={asm.id} style={{ borderBottom: '1px solid #e2e8f0', paddingBottom: '14px', marginBottom: '14px' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <strong>{asm.criteria_label || 'Yetkinlik'} (Ağırlık %{asm.weight})</strong>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <span className={`score-badge ${asm.score >= 80 ? 'high' : asm.score >= 60 ? 'medium' : 'low'}`}>
-                      {asm.score !== null ? `${asm.score}` : 'Eksik'}
-                    </span>
-                    <button type="button" className="button secondary" style={{ padding: '3px 8px', fontSize: '11px' }} onClick={() => { setRevisingAssessment(asm); setNewScore(asm.score || 75); }}>
-                      Düzelt
-                    </button>
+            {reqAssessments?.map((asm: any) => {
+              const reqMatch = data.requirements?.find((r: any) => r.id === asm.requirement_id);
+              const label = asm.criteria_label && asm.criteria_label !== 'Yetkinlik'
+                ? asm.criteria_label
+                : (reqMatch?.label || 'Yetkinlik');
+              return (
+                <div key={asm.id} style={{ borderBottom: '1px solid #e2e8f0', paddingBottom: '14px', marginBottom: '14px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <strong>{label} (Ağırlık %{asm.weight})</strong>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      {asm.original_ai_score !== undefined && asm.original_ai_score !== null && asm.original_ai_score !== asm.score && (
+                        <span className="muted" style={{ fontSize: '11px', textDecoration: 'line-through' }} title="Orijinal AI Puanı (APP-05)">
+                          AI: %{asm.original_ai_score}
+                        </span>
+                      )}
+                      <span className={`score-badge ${asm.score >= 80 ? 'high' : asm.score >= 60 ? 'medium' : 'low'}`}>
+                        {asm.score !== null ? `${asm.score}` : 'Eksik'}
+                      </span>
+                      <button type="button" className="button secondary" style={{ padding: '3px 8px', fontSize: '11px' }} onClick={() => { setRevisingAssessment(asm); setNewScore(asm.score || 75); }}>
+                        Düzelt
+                      </button>
+                    </div>
                   </div>
+                  <p style={{ margin: '6px 0', fontSize: '13px' }}>{asm.rationale}</p>
+                  {asm.evidence_items?.map((ev: any) => (
+                    <div key={ev.id} className="evidence-quote">
+                      <strong>Kanıt Alıntısı:</strong> "{ev.quote}"
+                    </div>
+                  ))}
+                  {asm.revised_by_email && (
+                    <p style={{ fontSize: '11px', color: '#0369a1', marginTop: '4px' }}>
+                      ✎ {asm.revised_by_email} tarafından revize edildi: "{asm.revision_note}"
+                    </p>
+                  )}
                 </div>
-                <p style={{ margin: '6px 0', fontSize: '13px' }}>{asm.rationale}</p>
-                {asm.evidence_items?.map((ev: any) => (
-                  <div key={ev.id} className="evidence-quote">
-                    <strong>Kanıt Alıntısı:</strong> "{ev.quote}"
-                  </div>
-                ))}
-                {asm.revised_by_email && (
-                  <p style={{ fontSize: '11px', color: '#0369a1', marginTop: '4px' }}>
-                    ✎ {asm.revised_by_email} tarafından revize edildi: "{asm.revision_note}"
-                  </p>
-                )}
-              </div>
-            ))}
+              );
+            })}
+          </div>
+
+          {/* Bölüm 08 & B08: Pozisyon Gereksinimleri Kapsamında Değerlendirme */}
+          <div className="card" style={{ marginTop: '16px' }}>
+            <h3 style={{ margin: '0 0 10px', fontSize: '15px' }}>Pozisyon Gereksinimleri Kapsam Kontrolü (Bölüm 08)</h3>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>Gereksinim</th><th>Zorunluluk</th><th>Kapsam Durumu</th></tr>
+                </thead>
+                <tbody>
+                  {data.requirements?.map((req: any) => {
+                    const asm = reqAssessments?.find((a: any) => a.requirement_id === req.id);
+                    const isEvaluated = asm && asm.score !== null && asm.status !== 'incomplete_evidence';
+                    return (
+                      <tr key={req.id}>
+                        <td><strong>{req.label}</strong> (%{req.weight})</td>
+                        <td>{req.required ? 'Zorunlu' : 'Tercih Edilen'}</td>
+                        <td>
+                          <span className={`badge ${isEvaluated ? 'active' : 'warning'}`}>
+                            {isEvaluated ? '✓ Değerlendirildi' : '⚠️ Kanıt Yetersiz / Eksik'}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           </div>
 
           {data.appeal && (
@@ -2990,9 +3155,9 @@ function CompanyReportView({ csrf }: { csrf: string }) {
               <p><strong>Gerekçe:</strong> {data.appeal.reason}</p>
               <p><strong>Referans Zamanı:</strong> {data.appeal.timestamp_reference || 'Belirtilmedi'}</p>
               <p><strong>Durum:</strong> <span className="badge">{statusLabel(data.appeal.status)}</span></p>
-              {data.appeal.reviewer_notes && (
+              {(data.appeal.decision_note || data.appeal.reviewer_notes) && (
                 <p style={{ marginTop: '6px', fontSize: '12px', color: '#0369a1' }}>
-                  <strong>İnceleme Kararı:</strong> {data.appeal.reviewer_notes}
+                  <strong>İnceleme Kararı ({statusLabel(data.appeal.decision || '')}):</strong> {data.appeal.decision_note || data.appeal.reviewer_notes}
                 </p>
               )}
             </div>
@@ -3031,6 +3196,7 @@ function CompanyCvEvaluationView({ csrf }: { csrf: string }) {
   const [positions, setPositions] = useState<any[]>([]);
   const [selectedPositionId, setSelectedPositionId] = useState<string>('all');
   const [statusFilter, setStatusFilter] = useState<string>('all');
+  const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedAppId, setSelectedAppId] = useState<string | null>(null);
   const [appDetail, setAppDetail] = useState<any>(null);
   const [error, setError] = useState('');
@@ -3067,11 +3233,11 @@ function CompanyCvEvaluationView({ csrf }: { csrf: string }) {
       .catch(e => setError(e.message));
   }, [selectedAppId]);
 
-  const handleStatusChange = async (newStatus: string) => {
+  const handleStatusChange = async (newStatus: string, cvMatchStatus?: string) => {
     if (!selectedAppId) return;
     setActionBusy(true);
     try {
-      await request(`/api/company/applications/${selectedAppId}/status`, csrf, { status: newStatus });
+      await request(`/api/company/applications/${selectedAppId}/status`, csrf, { status: newStatus, cvMatchStatus });
       await loadData();
       const updated = await request<any>(`/api/company/applications/${selectedAppId}`);
       setAppDetail(updated);
@@ -3100,18 +3266,34 @@ function CompanyCvEvaluationView({ csrf }: { csrf: string }) {
   if (loading) return <p>Yükleniyor…</p>;
   if (error) return <LoadError error={error} />;
 
+  const normalizeMatchStatus = (val: string | null | undefined) => {
+    if (!val) return 'needs_review';
+    if (val === 'matched') return 'suitable';
+    if (val === 'borderline') return 'needs_review';
+    if (val === 'unmatched') return 'unsuitable';
+    return val;
+  };
+
   const filteredApps = applications.filter(a => {
     if (selectedPositionId !== 'all' && a.position_id !== selectedPositionId) return false;
-    if (statusFilter !== 'all' && (a.cv_match_status || 'unmatched') !== statusFilter) return false;
+    const ms = normalizeMatchStatus(a.cv_match_status || a.match_status);
+    if (statusFilter !== 'all' && ms !== statusFilter) return false;
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      if (!String(a.candidate_name || '').toLowerCase().includes(q) && !String(a.email || '').toLowerCase().includes(q)) return false;
+    }
     return true;
   });
+
+  const cva = appDetail?.cv_analysis;
+  const currentMatchStatus = normalizeMatchStatus(cva?.match_status);
 
   return (
     <>
       <div className="heading">
         <div>
           <h1>CV Değerlendirme & Ön Eleme (B05)</h1>
-          <p className="muted">Gelen aday özgeçmişlerinin pozisyon gereksinimleriyle yapay zeka destekli karşılaştırmalı ön elemesi.</p>
+          <p className="muted">Gelen aday özgeçmişlerinin pozisyon gereksinimleriyle yapay zeka destekli karşılaştırmalı ön elemesi (CV-01 – CV-05).</p>
         </div>
       </div>
 
@@ -3119,6 +3301,15 @@ function CompanyCvEvaluationView({ csrf }: { csrf: string }) {
         {/* Sol Panel: Pozisyon Filtresi & Aday Listesi */}
         <div className="card" style={{ padding: '16px' }}>
           <div style={{ display: 'grid', gap: '10px', marginBottom: '14px' }}>
+            <div>
+              <input
+                type="search"
+                placeholder="🔍 Aday adı veya e-posta ara..."
+                value={searchQuery}
+                onChange={e => setSearchQuery(e.target.value)}
+                style={{ width: '100%', padding: '7px 10px', borderRadius: '6px', border: '1px solid #cbd5e1', fontSize: '13px' }}
+              />
+            </div>
             <div>
               <label htmlFor="b05-pos" style={{ fontSize: '12px', fontWeight: 'bold' }}>Pozisyon Filtresi:</label>
               <select
@@ -3142,9 +3333,9 @@ function CompanyCvEvaluationView({ csrf }: { csrf: string }) {
                 style={{ width: '100%', padding: '6px 10px', borderRadius: '6px', border: '1px solid #cbd5e1' }}
               >
                 <option value="all">Tüm Durumlar</option>
-                <option value="matched">✓ Eşleşti (Mülakata Uygun)</option>
-                <option value="borderline">⚠️ Sınırda (İnceleme Gerekli)</option>
-                <option value="unmatched">✕ Eşleşmedi</option>
+                <option value="suitable">✓ Uygun (Mülakata Uygun)</option>
+                <option value="needs_review">⚠️ İnsan İncelemesi Gerekli</option>
+                <option value="unsuitable">✕ Kriterleri Karşılamıyor</option>
               </select>
             </div>
           </div>
@@ -3155,7 +3346,7 @@ function CompanyCvEvaluationView({ csrf }: { csrf: string }) {
             ) : (
               filteredApps.map(app => {
                 const isSelected = app.id === selectedAppId;
-                const matchStatus = app.cv_match_status || 'unmatched';
+                const matchStatus = normalizeMatchStatus(app.cv_match_status || app.match_status);
                 return (
                   <div
                     key={app.id}
@@ -3171,8 +3362,8 @@ function CompanyCvEvaluationView({ csrf }: { csrf: string }) {
                   >
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                       <strong style={{ fontSize: '14px', color: '#0f172a' }}>{app.candidate_name}</strong>
-                      <span className={`badge ${matchStatus === 'matched' ? 'active' : matchStatus === 'borderline' ? 'warning' : 'rejected'}`} style={{ fontSize: '11px' }}>
-                        {matchStatus === 'matched' ? '✓ Eşleşti' : matchStatus === 'borderline' ? '⚠️ Sınırda' : '✕ Eşleşmedi'}
+                      <span className={`badge ${matchStatus === 'suitable' ? 'active' : matchStatus === 'needs_review' ? 'warning' : 'rejected'}`} style={{ fontSize: '11px' }}>
+                        {matchStatus === 'suitable' ? '✓ Uygun' : matchStatus === 'needs_review' ? '⚠️ İnsan İncelemesi' : '✕ Karşılamıyor'}
                       </span>
                     </div>
                     <div style={{ fontSize: '12px', color: '#64748b', marginTop: '4px' }}>
@@ -3180,7 +3371,7 @@ function CompanyCvEvaluationView({ csrf }: { csrf: string }) {
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '8px', fontSize: '11px' }}>
                       <span style={{ color: '#0369a1', fontWeight: 'bold' }}>
-                        Uyum: %{app.cv_match_percentage ?? 0}
+                        Pozisyon Uyumu: %{app.cv_match_percentage ?? 0}
                       </span>
                       <span className="muted">{new Date(app.created_at).toLocaleDateString('tr-TR')}</span>
                     </div>
@@ -3200,10 +3391,21 @@ function CompanyCvEvaluationView({ csrf }: { csrf: string }) {
                   <div>
                     <h2 style={{ margin: 0 }}>{appDetail.candidate_name}</h2>
                     <p className="muted" style={{ margin: '4px 0 0' }}>
-                      {appDetail.candidate_email} · Pozisyon: <strong>{appDetail.position_title}</strong> (v{appDetail.position_version})
+                      {appDetail.candidate_email || appDetail.email} · Pozisyon: <strong>{appDetail.position_title}</strong> (v{appDetail.position_version})
                     </p>
                   </div>
                   <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                    {appDetail.cv_id && (
+                      <a
+                        href={`/api/company/applications/${appDetail.id}/cv`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="button secondary"
+                        style={{ fontSize: '13px', padding: '8px 14px' }}
+                      >
+                        📄 PDF Belgesini Aç
+                      </a>
+                    )}
                     <Link
                       to="/sirket/davet-planlama"
                       className="button"
@@ -3216,86 +3418,119 @@ function CompanyCvEvaluationView({ csrf }: { csrf: string }) {
                       className="button secondary"
                       style={{ fontSize: '13px', padding: '8px 14px' }}
                       disabled={actionBusy}
-                      onClick={() => handleStatusChange('shortlisted')}
+                      onClick={() => handleStatusChange('shortlisted', 'suitable')}
                     >
-                      ⭐ Kısa Listeye Al
-                    </button>
-                    <button
-                      type="button"
-                      className="button secondary"
-                      style={{ fontSize: '13px', padding: '8px 14px', color: '#b91c1c' }}
-                      disabled={actionBusy}
-                      onClick={() => handleStatusChange('rejected')}
-                    >
-                      ✕ Reddet
+                      ✓ Uygun İşaretle
                     </button>
                     <button
                       type="button"
                       className="button secondary"
                       style={{ fontSize: '13px', padding: '8px 14px' }}
                       disabled={actionBusy}
-                      onClick={handleRunCvAnalysis}
+                      onClick={() => handleStatusChange('human_review', 'needs_review')}
                     >
-                      🔄 Analizi Yenile
+                      ⚠️ İncelemeye Al
                     </button>
+                    <button
+                      type="button"
+                      className="button secondary"
+                      style={{ fontSize: '13px', padding: '8px 14px', color: '#b91c1c' }}
+                      disabled={actionBusy}
+                      onClick={() => handleStatusChange('rejected', 'unsuitable')}
+                    >
+                      ✕ Karşılamıyor
+                    </button>
+                    {appDetail.cv_id && (
+                      <button
+                        type="button"
+                        className="button secondary"
+                        style={{ fontSize: '13px', padding: '8px 14px' }}
+                        disabled={actionBusy}
+                        onClick={handleRunCvAnalysis}
+                      >
+                        🔄 Analizi Yenile
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
 
-              {appDetail.cv_analysis ? (
+              {cva ? (
                 <>
                   <div className="card">
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-                      <h3 style={{ margin: 0 }}>🤖 AI Ön Eleme Değerlendirmesi</h3>
-                      <span className={`badge ${appDetail.cv_analysis.match_status === 'matched' ? 'active' : appDetail.cv_analysis.match_status === 'borderline' ? 'warning' : 'rejected'}`} style={{ fontSize: '13px', padding: '4px 10px' }}>
-                        {appDetail.cv_analysis.match_status === 'matched' ? '✓ Mülakata Uygun' : appDetail.cv_analysis.match_status === 'borderline' ? '⚠️ Sınırda Aday' : '✕ Kriterleri Karşılamıyor'}
+                      <h3 style={{ margin: 0 }}>🤖 AI Ön Eleme Değerlendirmesi (CV-01 – CV-05)</h3>
+                      <span className={`badge ${currentMatchStatus === 'suitable' ? 'active' : currentMatchStatus === 'needs_review' ? 'warning' : 'rejected'}`} style={{ fontSize: '13px', padding: '4px 10px' }}>
+                        {currentMatchStatus === 'suitable' ? '✓ Uygun — Pozisyon Ölçütleriyle Uyumlu' : currentMatchStatus === 'needs_review' ? '⚠️ İnsan İncelemesi Gerekli' : '✕ Kriterleri Karşılamıyor'}
                       </span>
                     </div>
                     <p style={{ fontSize: '14px', lineHeight: 1.6, color: '#1e293b' }}>
-                      {appDetail.cv_analysis.summary}
+                      {cva.summary}
                     </p>
+                    {cva.limitations && (
+                      <div style={{ marginTop: '10px', padding: '10px 12px', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: '6px', fontSize: '13px', color: '#92400e' }}>
+                        <strong>⚠️ Sınırlılıklar & İnceleme Notu (CV-04):</strong> {cva.limitations}
+                      </div>
+                    )}
 
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginTop: '16px' }}>
                       <div style={{ padding: '12px', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '6px' }}>
-                        <strong style={{ color: '#166534', fontSize: '13px' }}>✓ Öne Çıkan Güçlü Yönler:</strong>
-                        <ul style={{ margin: '6px 0 0', paddingLeft: '18px', fontSize: '13px', color: '#15803d' }}>
-                          {appDetail.cv_analysis.strengths?.map((s: string, idx: number) => (
-                            <li key={idx}>{s}</li>
-                          )) || <li>Öne çıkan güçlü yön belirtilmedi.</li>}
-                        </ul>
+                        <strong style={{ color: '#166534', fontSize: '13px' }}>📁 Tespit Edilen Projeler (CV-02 / AC-04):</strong>
+                        {cva.extracted_projects?.length > 0 ? (
+                          <ul style={{ margin: '6px 0 0', paddingLeft: '18px', fontSize: '13px', color: '#15803d' }}>
+                            {cva.extracted_projects.map((p: any, idx: number) => (
+                              <li key={idx} style={{ marginBottom: '4px' }}>
+                                <strong>{p.title}</strong> ({p.role_or_tech}) — <span>{p.description}</span>
+                                {p.source_citation && <small className="muted" style={{ display: 'block' }}>Kaynak: {p.source_citation}</small>}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <p className="muted" style={{ margin: '6px 0 0', fontSize: '12px' }}>Doğrudan proje kaydı ayrıştırılamadı.</p>
+                        )}
                       </div>
 
-                      <div style={{ padding: '12px', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: '6px' }}>
-                        <strong style={{ color: '#991b1b', fontSize: '13px' }}>⚠️ Tespit Edilen Eksiklikler:</strong>
-                        <ul style={{ margin: '6px 0 0', paddingLeft: '18px', fontSize: '13px', color: '#b91c1c' }}>
-                          {appDetail.cv_analysis.gaps?.map((g: string, idx: number) => (
-                            <li key={idx}>{g}</li>
-                          )) || <li>Belirgin bir eksiklik bulunmadı.</li>}
-                        </ul>
+                      <div style={{ padding: '12px', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '6px' }}>
+                        <strong style={{ color: '#0f172a', fontSize: '13px' }}>⚡ Tespit Edilen Teknik Beceriler (CV-02):</strong>
+                        <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '8px' }}>
+                          {cva.extracted_skills?.length > 0 ? cva.extracted_skills.map((s: string, idx: number) => (
+                            <span key={idx} className="badge" style={{ background: '#e0e7ff', color: '#3730a3' }}>{s}</span>
+                          )) : <span className="muted" style={{ fontSize: '12px' }}>Beceri etiketi bulunamadı.</span>}
+                        </div>
+                        <p className="muted" style={{ fontSize: '11px', marginTop: '12px' }}>
+                          * CV uygunluğu yalnız ön elemedir; mülakatta ölçülen yetkinlik puanı ayrı tutulur (CV-05).
+                        </p>
                       </div>
                     </div>
                   </div>
 
                   <div className="card">
-                    <h3>Yetkinlik Eşleşme Tablosu</h3>
+                    <h3>Yetkinlik Eşleşme Tablosu (CV-01 & CV-03)</h3>
                     <div className="table-wrap">
                       <table>
                         <thead>
-                          <tr><th>Gereksinim</th><th>Zorunlu?</th><th>CV'deki Kanıt / Bulgu</th><th>Durum</th></tr>
+                          <tr><th>Gereksinim</th><th>Zorunluluk</th><th>Eşleşme Düzeyi</th><th>CV Kanıtı & Kaynak Bölümü (CV-03)</th><th>Değerlendirme Gerekçesi</th></tr>
                         </thead>
                         <tbody>
-                          {appDetail.requirements?.map((req: any) => {
-                            const match = appDetail.cv_analysis.criteria_matches?.find((m: any) => m.requirement_id === req.id || m.label === req.label);
+                          {(cva.criteria_matches?.length ? cva.criteria_matches : appDetail.requirements || []).map((item: any, idx: number) => {
+                            const match = cva.criteria_matches?.find((m: any) => m.requirement_id === item.requirement_id || m.requirement_id === item.id || m.requirement_label === item.label) || item;
+                            const label = match.requirement_label || item.label || 'Gereksinim';
+                            const isReq = match.required !== undefined ? match.required : item.required;
+                            const level = match.match_level || (match.matched ? 'full' : 'none');
                             return (
-                              <tr key={req.id}>
-                                <td><strong>{req.label}</strong> (Ağırlık %{req.weight})</td>
-                                <td>{req.required ? '✓ Zorunlu' : 'Opsiyonel'}</td>
-                                <td style={{ fontSize: '13px' }}>{match?.evidence || match?.notes || 'CV metninde doğrudan referans bulunamadı.'}</td>
+                              <tr key={match.requirement_id || item.id || idx}>
+                                <td><strong>{label}</strong></td>
+                                <td><span className="badge">{isReq ? 'Zorunlu' : 'Tercih Edilen'}</span></td>
                                 <td>
-                                  <span className={`badge ${match?.matched ? 'active' : 'rejected'}`}>
-                                    {match?.matched ? '✓ Karşılıyor' : '✕ Eksik'}
+                                  <span className={`badge ${level === 'full' ? 'active' : level === 'partial' ? 'warning' : 'rejected'}`}>
+                                    {level === 'full' ? '✓ Tam Eşleşme' : level === 'partial' ? '⚠️ Kısmi Kanıt' : '✕ Eşleşme Yok'}
                                   </span>
                                 </td>
+                                <td style={{ fontSize: '12px', fontStyle: 'italic', maxWidth: '260px' }}>
+                                  "{match.evidence_quote || match.evidence || 'Doğrudan kanıt bulunamadı'}"
+                                  {match.source_section && <div className="muted" style={{ fontStyle: 'normal', fontSize: '11px' }}>Kaynak: {match.source_section}</div>}
+                                </td>
+                                <td style={{ fontSize: '12px' }}>{match.rationale || match.notes || '-'}</td>
                               </tr>
                             );
                           })}
@@ -3307,18 +3542,15 @@ function CompanyCvEvaluationView({ csrf }: { csrf: string }) {
               ) : (
                 <div className="card" style={{ textAlign: 'center', padding: '32px 20px' }}>
                   <p className="muted">Bu aday için henüz AI CV analizi çalıştırılmamış.</p>
-                  <button type="button" className="button" disabled={actionBusy} onClick={handleRunCvAnalysis}>
-                    CV Analizini Başlat
-                  </button>
-                </div>
-              )}
-
-              {appDetail.cv_text && (
-                <div className="card">
-                  <h3>Orijinal CV Metni</h3>
-                  <div style={{ maxHeight: '200px', overflowY: 'auto', background: '#f8fafc', padding: '12px', borderRadius: '6px', fontSize: '12px', whiteSpace: 'pre-wrap', color: '#475569' }}>
-                    {appDetail.cv_text}
-                  </div>
+                  {appDetail.cv_id ? (
+                    <button type="button" className="button" disabled={actionBusy} onClick={handleRunCvAnalysis}>
+                      {actionBusy ? 'Analiz Yapılıyor…' : 'CV Analizini Başlat'}
+                    </button>
+                  ) : (
+                    <Link className="button secondary" to={`/sirket/basvurular/${appDetail.id}`}>
+                      Başvuru Detayından PDF CV Yükle →
+                    </Link>
+                  )}
                 </div>
               )}
             </div>
@@ -3337,9 +3569,12 @@ function CompanyCvEvaluationView({ csrf }: { csrf: string }) {
 function CompanyAppealsView({ csrf }: { csrf: string }) {
   const [data, setData] = useState<{ appeals: any[] } | null>(null);
   const [error, setError] = useState('');
+  const [queueFilter, setQueueFilter] = useState<'all' | 'open' | 'in_review' | 'resolved'>('all');
   const [selectedAppealId, setSelectedAppealId] = useState<string | null>(null);
   const [decision, setDecision] = useState<'upheld' | 'revised' | 'additional_interview'>('revised');
   const [decisionNote, setDecisionNote] = useState('');
+  const [targetAssessmentId, setTargetAssessmentId] = useState<string>('');
+  const [revisedScoreInput, setRevisedScoreInput] = useState<string>('82');
   const [busy, setBusy] = useState(false);
 
   const reload = () => request<any>('/api/company/appeals').then(res => {
@@ -3351,13 +3586,43 @@ function CompanyAppealsView({ csrf }: { csrf: string }) {
   useEffect(() => { reload().catch(e => setError(e.message)); }, []);
 
   const selectedAppeal = data?.appeals?.find(a => a.id === selectedAppealId) || null;
+  const reqAssessments = (selectedAppeal?.assessments || []).filter((a: any) => !a.is_overall);
+
+  useEffect(() => {
+    if (reqAssessments.length > 0 && !targetAssessmentId) {
+      setTargetAssessmentId(reqAssessments[0].id);
+      setRevisedScoreInput(String(Math.min(100, (reqAssessments[0].score || 60) + 15)));
+    }
+  }, [selectedAppealId, reqAssessments.length]);
+
+  const handleMarkInReview = async () => {
+    if (!selectedAppeal) return;
+    setBusy(true);
+    try {
+      await request(`/api/company/appeals/${selectedAppeal.id}/decide`, csrf, {
+        nextStatus: 'in_review',
+        expectedStatus: selectedAppeal.status
+      });
+      await reload();
+    } catch (err) {
+      alert((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const handleDecision = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedAppeal) return;
     setBusy(true);
     try {
-      await request(`/api/company/appeals/${selectedAppeal.id}/decide`, csrf, { decision, decisionNote });
+      await request(`/api/company/appeals/${selectedAppeal.id}/decide`, csrf, {
+        decision,
+        decisionNote,
+        expectedStatus: selectedAppeal.status,
+        assessmentId: decision === 'revised' ? targetAssessmentId : undefined,
+        newScore: decision === 'revised' ? Number(revisedScoreInput) : undefined
+      });
       setDecisionNote('');
       await reload();
     } catch (err) {
@@ -3370,24 +3635,56 @@ function CompanyAppealsView({ csrf }: { csrf: string }) {
   if (error) return <LoadError error={error} />;
   if (!data) return <p>Yükleniyor…</p>;
 
+  const filteredAppeals = data.appeals.filter(a => {
+    if (queueFilter === 'open') return a.status === 'submitted' || a.status === 'assigned';
+    if (queueFilter === 'in_review') return a.status === 'in_review';
+    if (queueFilter === 'resolved') return a.status === 'resolved';
+    return true;
+  });
+
   return (
     <>
       <div className="heading">
         <div>
           <h1>İtiraz İnceleme Paneli (B09)</h1>
-          <p className="muted">Adayların mülakat değerlendirmelerine yaptığı itiraz kuyruğu ve 3 bölmeli karar masası.</p>
+          <p className="muted">Adayların mülakat değerlendirmelerine yaptığı itiraz kuyruğu, kanıt dökümü ve 3 bölmeli karar masası (APP-01 – APP-07).</p>
         </div>
       </div>
 
       {data.appeals.length === 0 ? (
         <div className="card"><p className="empty">Şu anda incelenmeyi bekleyen itiraz bulunmuyor.</p></div>
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: '320px 1.2fr 1fr', gap: '20px', alignItems: 'start' }}>
-          {/* Sol Bölme: İtiraz Kuyruğu */}
+        <div style={{ display: 'grid', gridTemplateColumns: '320px 1.25fr 1fr', gap: '20px', alignItems: 'start' }}>
+          {/* Sol Bölme: İtiraz Kuyruğu & Durum Sekmeleri */}
           <div className="card" style={{ padding: '16px' }}>
-            <h3 style={{ margin: '0 0 12px', fontSize: '16px' }}>İtiraz Kuyruğu ({data.appeals.length})</h3>
+            <h3 style={{ margin: '0 0 10px', fontSize: '16px' }}>İtiraz Kuyruğu ({data.appeals.length})</h3>
+            <div style={{ display: 'flex', gap: '4px', marginBottom: '12px', flexWrap: 'wrap' }}>
+              {[
+                { key: 'all', label: `Tümü (${data.appeals.length})` },
+                { key: 'open', label: `Açık (${data.appeals.filter(x => x.status === 'submitted' || x.status === 'assigned').length})` },
+                { key: 'in_review', label: `İncelemede (${data.appeals.filter(x => x.status === 'in_review').length})` },
+                { key: 'resolved', label: `Tamamlanan (${data.appeals.filter(x => x.status === 'resolved').length})` }
+              ].map(tab => (
+                <button
+                  key={tab.key}
+                  type="button"
+                  onClick={() => setQueueFilter(tab.key as any)}
+                  style={{
+                    fontSize: '11px',
+                    padding: '4px 8px',
+                    borderRadius: '6px',
+                    border: '1px solid #cbd5e1',
+                    background: queueFilter === tab.key ? '#0f172a' : '#f8fafc',
+                    color: queueFilter === tab.key ? '#fff' : '#334155',
+                    cursor: 'pointer'
+                  }}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-              {data.appeals.map(a => {
+              {filteredAppeals.map(a => {
                 const isSelected = a.id === selectedAppealId;
                 return (
                   <div
@@ -3423,7 +3720,7 @@ function CompanyAppealsView({ csrf }: { csrf: string }) {
             </div>
           </div>
 
-          {/* Orta Bölme: Kanıt & Transkript İncelemesi */}
+          {/* Orta Bölme: İtiraz Detayı, Kanıt (Video & Döküm) ve Denetim Geçmişi */}
           <div className="card" style={{ padding: '20px' }}>
             {selectedAppeal ? (
               <>
@@ -3445,7 +3742,7 @@ function CompanyAppealsView({ csrf }: { csrf: string }) {
 
                 <div style={{ marginBottom: '16px' }}>
                   <label style={{ fontSize: '12px', fontWeight: 'bold', color: '#475569', textTransform: 'uppercase' }}>
-                    Adayın İtiraz Gerekçesi
+                    Adayın İtirazı (APP-01)
                   </label>
                   <div style={{ padding: '12px', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: '6px', marginTop: '6px', fontSize: '14px', color: '#92400e' }}>
                     "{selectedAppeal.reason}"
@@ -3454,27 +3751,66 @@ function CompanyAppealsView({ csrf }: { csrf: string }) {
 
                 <div style={{ marginBottom: '16px' }}>
                   <label style={{ fontSize: '12px', fontWeight: 'bold', color: '#475569', textTransform: 'uppercase' }}>
-                    Zaman Referansı & Kanıt İncelemesi (AC-10 / AC-11)
+                    Kanıt (Video Zaman Damgası & Konuşma Dökümü — APP-03)
                   </label>
                   <div style={{ padding: '12px', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '6px', marginTop: '6px', fontSize: '13px' }}>
-                    <p style={{ margin: 0 }}>
-                      ⏱ <strong>Belirtilen Zaman Damgası:</strong> {selectedAppeal.timestamp_reference || '00:00 (Tüm Mülakat)'}
+                    <p style={{ margin: '0 0 8px' }}>
+                      ⏱ <strong>İlgili Zaman Damgası:</strong> <span className="badge">{selectedAppeal.timestamp_reference || '00:00 (Tüm Mülakat)'}</span>
                     </p>
-                    <p style={{ margin: '8px 0 0', color: '#64748b', fontSize: '12px' }}>
-                      Bu zaman aralığında adayın verdiği yanıt rubric kriterlerine göre incelenmelidir. İlgili ses/video kesiti rapordaki transkriptten izlenebilir.
-                    </p>
+                    {selectedAppeal.turns?.length > 0 ? (
+                      <div style={{ maxHeight: '160px', overflowY: 'auto', display: 'grid', gap: '6px', borderTop: '1px solid #e2e8f0', paddingTop: '8px' }}>
+                        {selectedAppeal.turns.slice(0, 4).map((t: any) => (
+                          <div key={t.id} style={{ fontSize: '12px', padding: '6px 8px', background: '#fff', borderRadius: '4px', border: '1px solid #e2e8f0' }}>
+                            <strong>{t.speaker === 'ai' ? '🤖 AI:' : `👤 ${selectedAppeal.candidate_name}:`}</strong> {t.transcript_text}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="muted" style={{ margin: 0, fontSize: '12px' }}>Konuşma dökümü rapordan incelenebilir.</p>
+                    )}
                   </div>
                 </div>
 
-                {selectedAppeal.reviewer_notes && (
+                {(selectedAppeal.decision_note || selectedAppeal.reviewer_notes) && (
                   <div style={{ marginTop: '16px', padding: '12px', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '6px' }}>
-                    <strong style={{ color: '#166534', fontSize: '13px' }}>Verilen Karar ({selectedAppeal.decision}):</strong>
-                    <p style={{ margin: '4px 0 0', fontSize: '13px', color: '#15803d' }}>{selectedAppeal.reviewer_notes}</p>
-                    {selectedAppeal.resolved_at && (
+                    <strong style={{ color: '#166534', fontSize: '13px' }}>Verilen Karar ({statusLabel(selectedAppeal.decision || '')}):</strong>
+                    <p style={{ margin: '4px 0 0', fontSize: '13px', color: '#15803d' }}>{selectedAppeal.decision_note || selectedAppeal.reviewer_notes}</p>
+                    {(selectedAppeal.decided_at || selectedAppeal.resolved_at) && (
                       <div className="muted" style={{ fontSize: '11px', marginTop: '4px' }}>
-                        Çözümlenme: {new Date(selectedAppeal.resolved_at).toLocaleString('tr-TR')}
+                        Çözümlenme: {new Date(selectedAppeal.decided_at || selectedAppeal.resolved_at).toLocaleString('tr-TR')}
+                        {selectedAppeal.decided_by_email ? ` · ${selectedAppeal.decided_by_email}` : ''}
                       </div>
                     )}
+                  </div>
+                )}
+
+                {/* Denetim Geçmişi Tablosu (Mockup 09 - Sayfa 32) */}
+                {selectedAppeal.audit_logs?.length > 0 && (
+                  <div style={{ marginTop: '18px' }}>
+                    <label style={{ fontSize: '12px', fontWeight: 'bold', color: '#475569', textTransform: 'uppercase' }}>
+                      Denetim Geçmişi (APP-05 / Bölüm 11)
+                    </label>
+                    <div className="table-wrap" style={{ marginTop: '6px' }}>
+                      <table>
+                        <thead>
+                          <tr><th>Tarih</th><th>İşlem</th><th>Önceki → Yeni</th><th>Yapan</th></tr>
+                        </thead>
+                        <tbody>
+                          {selectedAppeal.audit_logs.slice(0, 5).map((log: any) => (
+                            <tr key={log.id} style={{ fontSize: '12px' }}>
+                              <td>{new Date(log.created_at).toLocaleDateString('tr-TR')}</td>
+                              <td>{log.action === 'assessment_revision' ? 'Puan Revizyonu' : log.action === 'appeal_resolution' ? 'İtiraz Kararı' : log.action}</td>
+                              <td>
+                                {log.old_values?.score !== undefined
+                                  ? `%${log.old_values.score} → %${log.new_values?.score}`
+                                  : (log.new_values?.decision || '-')}
+                              </td>
+                              <td>{log.user_email || 'Sistem'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
                   </div>
                 )}
               </>
@@ -3483,61 +3819,129 @@ function CompanyAppealsView({ csrf }: { csrf: string }) {
             )}
           </div>
 
-          {/* Sağ Bölme: Karar & İşlem Masası */}
+          {/* Sağ Bölme: Değerlendirmeler (AI vs İnsan) & Karar Masası */}
           <div className="card" style={{ padding: '20px' }}>
-            <h3 style={{ margin: '0 0 12px', fontSize: '16px' }}>⚖️ Karar Masası</h3>
+            <h3 style={{ margin: '0 0 12px', fontSize: '16px' }}>⚖️ Değerlendirmeler & Karar</h3>
             {selectedAppeal ? (
-              selectedAppeal.status === 'resolved' ? (
-                <div style={{ textAlign: 'center', padding: '24px 0' }}>
-                  <div style={{ fontSize: '36px', marginBottom: '8px' }}>✓</div>
-                  <strong style={{ color: '#0f172a' }}>Bu itiraz karara bağlanmıştır.</strong>
-                  <p className="muted" style={{ fontSize: '12px', marginTop: '4px' }}>
-                    Karar türü: <strong>{selectedAppeal.decision}</strong>
-                  </p>
-                </div>
-              ) : (
-                <form onSubmit={handleDecision}>
-                  <label htmlFor="dec-type" style={{ display: 'block', fontSize: '13px', fontWeight: 'bold', marginBottom: '6px' }}>
-                    Karar Seçeneği:
-                  </label>
-                  <select
-                    id="dec-type"
-                    value={decision}
-                    onChange={e => setDecision(e.target.value as any)}
-                    style={{ width: '100%', padding: '10px', borderRadius: '6px', border: '1px solid #cbd5e1', marginBottom: '14px' }}
-                  >
-                    <option value="revised">✓ İtiraz Haklı Bulundu (Puanı Revize Et)</option>
-                    <option value="upheld">✕ İtiraz Reddedildi (Mevcut Puanı Koru)</option>
-                    <option value="additional_interview">🔄 Tamamlayıcı / Ek Görüşme Planla</option>
-                  </select>
+              <>
+                {/* Orijinal AI vs İnsan Değerlendirmesi Kartları (Sayfa 32 Mockup 09) */}
+                {reqAssessments.length > 0 && (
+                  <div style={{ marginBottom: '16px', display: 'grid', gap: '8px' }}>
+                    {reqAssessments.map((asm: any) => (
+                      <div key={asm.id} style={{ padding: '10px', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '6px', fontSize: '12px' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <strong>{asm.criteria_label || 'Yetkinlik'} (%{asm.weight})</strong>
+                          <span className="badge" style={{ background: asm.status === 'revised_by_human' ? '#dcfce7' : '#e0f2fe', color: asm.status === 'revised_by_human' ? '#166534' : '#0369a1' }}>
+                            {asm.status === 'revised_by_human' ? `İnsan Revizyonu: %${asm.score}` : `AI Puanı: %${asm.score ?? 'Eksik'}`}
+                          </span>
+                        </div>
+                        <div className="muted" style={{ marginTop: '4px' }}>{asm.rationale}</div>
+                        {asm.revision_note && (
+                          <div style={{ marginTop: '4px', color: '#15803d' }}>
+                            <strong>İnsan Değerlendirici Notu:</strong> "{asm.revision_note}"
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
 
-                  <label htmlFor="dec-text" style={{ display: 'block', fontSize: '13px', fontWeight: 'bold', marginBottom: '6px' }}>
-                    Karar Gerekçesi (Zorunlu Denetim Notu):
-                  </label>
-                  <textarea
-                    id="dec-text"
-                    required
-                    minLength={5}
-                    rows={4}
-                    value={decisionNote}
-                    onChange={e => setDecisionNote(e.target.value)}
-                    style={{ width: '100%', padding: '10px', borderRadius: '6px', border: '1px solid #cbd5e1', marginBottom: '16px' }}
-                    placeholder="Transkript incelenmiş olup adayın açıklaması rubric ölçütlerimize uygun bulunmuştur..."
-                  />
+                {selectedAppeal.status === 'resolved' ? (
+                  <div style={{ textAlign: 'center', padding: '18px 0', background: '#f0fdf4', borderRadius: '8px', border: '1px solid #bbf7d0' }}>
+                    <div style={{ fontSize: '28px', marginBottom: '4px', color: '#166534' }}>✓</div>
+                    <strong style={{ color: '#0f172a' }}>Bu itiraz karara bağlanmıştır.</strong>
+                    <p className="muted" style={{ fontSize: '12px', marginTop: '4px' }}>
+                      Karar: <strong>{statusLabel(selectedAppeal.decision)}</strong>
+                    </p>
+                  </div>
+                ) : (
+                  <form onSubmit={handleDecision}>
+                    {selectedAppeal.status === 'submitted' && (
+                      <button
+                        type="button"
+                        className="button secondary"
+                        disabled={busy}
+                        onClick={handleMarkInReview}
+                        style={{ width: '100%', marginBottom: '12px', fontSize: '12px', padding: '8px' }}
+                      >
+                        🔍 İncelemeye Al (Durumu Güncelle)
+                      </button>
+                    )}
 
-                  <button
-                    type="submit"
-                    className="button"
-                    disabled={busy || decisionNote.trim().length < 5}
-                    style={{ width: '100%', padding: '12px', fontSize: '14px', background: '#0284c7', borderColor: '#0284c7' }}
-                  >
-                    {busy ? 'Kaydediliyor…' : 'Kararı Onayla ve Bildir'}
-                  </button>
-                  <p className="muted" style={{ fontSize: '11px', marginTop: '10px', textAlign: 'center' }}>
-                    🔒 Karar denetim kütüğüne (audit log) ve aday bildirim sistemine kaydedilir.
-                  </p>
-                </form>
-              )
+                    <label htmlFor="dec-type" style={{ display: 'block', fontSize: '13px', fontWeight: 'bold', marginBottom: '6px' }}>
+                      Karar Seçeneği:
+                    </label>
+                    <select
+                      id="dec-type"
+                      value={decision}
+                      onChange={e => setDecision(e.target.value as any)}
+                      style={{ width: '100%', padding: '10px', borderRadius: '6px', border: '1px solid #cbd5e1', marginBottom: '12px' }}
+                    >
+                      <option value="revised">✓ İtiraz Haklı Bulundu (Puanı Revize Et)</option>
+                      <option value="upheld">✕ İtiraz Reddedildi (Mevcut Puanı Koru)</option>
+                      <option value="additional_interview">🔄 Tamamlayıcı / Ek Görüşme Planla</option>
+                    </select>
+
+                    {decision === 'revised' && reqAssessments.length > 0 && (
+                      <div style={{ padding: '10px', background: '#f0f9ff', border: '1px solid #bae6fd', borderRadius: '6px', marginBottom: '12px' }}>
+                        <label htmlFor="rev-asm-select" style={{ display: 'block', fontSize: '12px', fontWeight: 'bold', marginBottom: '4px' }}>
+                          Revize Edilecek Yetkinlik:
+                        </label>
+                        <select
+                          id="rev-asm-select"
+                          value={targetAssessmentId}
+                          onChange={e => setTargetAssessmentId(e.target.value)}
+                          style={{ width: '100%', padding: '6px', borderRadius: '4px', border: '1px solid #cbd5e1', marginBottom: '8px', fontSize: '12px' }}
+                        >
+                          {reqAssessments.map((asm: any) => (
+                            <option key={asm.id} value={asm.id}>
+                              {asm.criteria_label || 'Yetkinlik'} (Mevcut: %{asm.score ?? 0})
+                            </option>
+                          ))}
+                        </select>
+                        <label htmlFor="rev-score-input" style={{ display: 'block', fontSize: '12px', fontWeight: 'bold', marginBottom: '4px' }}>
+                          Düzeltme Sonrası Yeni Puan (%):
+                        </label>
+                        <input
+                          id="rev-score-input"
+                          type="number"
+                          min={0}
+                          max={100}
+                          value={revisedScoreInput}
+                          onChange={e => setRevisedScoreInput(e.target.value)}
+                          style={{ width: '100%', padding: '6px 8px', borderRadius: '4px', border: '1px solid #cbd5e1', fontSize: '13px' }}
+                        />
+                      </div>
+                    )}
+
+                    <label htmlFor="dec-text" style={{ display: 'block', fontSize: '13px', fontWeight: 'bold', marginBottom: '6px' }}>
+                      Karar Gerekçesi (Zorunlu Denetim Notu):
+                    </label>
+                    <textarea
+                      id="dec-text"
+                      required
+                      minLength={5}
+                      rows={4}
+                      value={decisionNote}
+                      onChange={e => setDecisionNote(e.target.value)}
+                      style={{ width: '100%', padding: '10px', borderRadius: '6px', border: '1px solid #cbd5e1', marginBottom: '16px' }}
+                      placeholder="Transkript incelenmiş olup adayın açıklaması rubric ölçütlerimize uygun bulunmuştur..."
+                    />
+
+                    <button
+                      type="submit"
+                      className="button"
+                      disabled={busy || decisionNote.trim().length < 5}
+                      style={{ width: '100%', padding: '12px', fontSize: '14px', background: '#0284c7', borderColor: '#0284c7' }}
+                    >
+                      {busy ? 'Kaydediliyor…' : 'Düzeltmeyi Kaydet ve Bildir'}
+                    </button>
+                    <p className="muted" style={{ fontSize: '11px', marginTop: '10px', textAlign: 'center' }}>
+                      🔒 Karar ve eski/yeni puan denetim kütüğüne (APP-05 / APP-07) kaydedilir.
+                    </p>
+                  </form>
+                )}
+              </>
             ) : null}
           </div>
         </div>

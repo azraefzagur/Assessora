@@ -2,7 +2,7 @@ import 'dotenv/config';
 import pg from 'pg';
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL tanımlanmalı. PostgreSQL olmadan uygulama başlatılmaz.');
-export const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, connectionTimeoutMillis: 3000, max: 10 });
+export const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, connectionTimeoutMillis: 15000, max: 10 });
 pool.on('error', error => {
   console.error('PostgreSQL boş bağlantısı kapandı:', error.message);
 });

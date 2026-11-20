@@ -2,7 +2,7 @@ import type { Express, NextFunction, Request, RequestHandler, Response } from 'e
 import { pool, transaction } from './db.ts';
 import { newId, hashPassword, createSession, setSessionCookie } from './security.ts';
 import { codeForId, codeHash, mailMode, processEmailJobs } from './email.ts';
-import { idFromInvitationToken, invitationHash } from './invitation.ts';
+import { idFromInvitationToken, invitationHash, invitationToken } from './invitation.ts';
 import { HttpError, ValidationError, uuidPattern } from './validation.ts';
 import { extractTextFromPdf, analyzeCvContent } from './cv-analysis.ts';
 import type { Membership } from './types.ts';
@@ -454,9 +454,34 @@ export function registerStage3(
       let nextAiTurn: any = null;
       let nextQuestionIdx = currentIdx;
       let isCompleted = false;
+      let recoveryWarning: string | null = null;
 
-      // Eğer bu soru için henüz takip sorusu sorulmadıysa ve aday teknik bir iddia sunduysa "terletme/derinleştirme" sorusu sor:
-      if (turnsForCurrentQ < 3 && currentQ?.followup_template) {
+      // INT-06: Sessizlik, anlaşılmayan ses veya çok kısa/belirsiz transkript için toparlanma davranışı
+      const wordCount = text.split(/\s+/).filter(Boolean).length;
+      const isUnclearOrTooShort = text.length < 15 || wordCount < 3 || /^(ses|deneme|alo|duyuyor|anlamadım|bilmiyorum|\.+|\?+)$/i.test(text);
+
+      if (isUnclearOrTooShort && turnsForCurrentQ <= 2 && currentQ) {
+        const aiTurnId = newId();
+        const aiTurnNo = candTurnNo + 1;
+        const recoveryText = `Sesiniz tam anlaşılamadı veya yanıtınız değerlendirme için çok kısa kaldı (INT-06 Toparlanma). Lütfen ${currentQ.requirement_label} konusundaki yaklaşımınızı birkaç cümleyle tekrar ifade edebilir veya transkript kutusundan düzelterek gönderebilir misiniz?`;
+        recoveryWarning = 'Yanıtınız çok kısa veya belirsiz algılandı. Lütfen mikrofonunuzu kontrol ederek veya metin kutusundan düzenleyerek detaylandırın.';
+
+        await client.query(`
+          INSERT INTO interview_turns (id, session_id, turn_number, speaker, requirement_id, question_text, transcript_text, is_followup, audio_timestamp_start, audio_timestamp_end)
+          VALUES ($1, $2, $3, 'ai', $4, $5, $6, true, $7, $8)
+        `, [aiTurnId, sessionId, aiTurnNo, currentQ.requirement_id, currentQ.question_text, recoveryText, candTimestampEnd + 2.0, candTimestampEnd + 14.0]);
+
+        nextAiTurn = {
+          id: aiTurnId,
+          turn_number: aiTurnNo,
+          speaker: 'ai',
+          requirement_id: currentQ.requirement_id,
+          question_text: currentQ.question_text,
+          transcript_text: recoveryText,
+          is_followup: true,
+          is_recovery: true
+        };
+      } else if (turnsForCurrentQ < 3 && currentQ?.followup_template) {
         const aiTurnId = newId();
         const aiTurnNo = candTurnNo + 1;
         let followupText = await generateAiFollowup(text, currentQ.requirement_label, session.position_title || 'Yazılım Pozisyonu');
@@ -549,7 +574,8 @@ export function registerStage3(
         candidateTurn: { id: candTurnId, turn_number: candTurnNo, speaker: 'candidate', transcript_text: text },
         nextAiTurn,
         currentQuestionIndex: nextQuestionIdx,
-        isCompleted
+        isCompleted,
+        recoveryWarning
       };
     });
 
@@ -836,11 +862,12 @@ export function registerStage3(
 
     // Değerlendirmeler ve Kanıtlar
     const assessments = (await pool.query(`
-      SELECT a.*, u.email AS revised_by_email
+      SELECT a.*, u.email AS revised_by_email, pr.label AS criteria_label, pr.required AS criteria_required
       FROM assessments a
       LEFT JOIN users u ON u.id = a.revised_by_user_id
+      LEFT JOIN position_requirements pr ON pr.id = a.requirement_id
       WHERE a.application_id = $1
-      ORDER BY a.is_overall ASC, a.created_at ASC
+      ORDER BY a.is_overall ASC, pr.sort_order ASC, a.created_at ASC
     `, [applicationId])).rows;
 
     const detailedAssessments = [];
@@ -852,16 +879,37 @@ export function registerStage3(
         WHERE e.assessment_id = $1
       `, [asm.id])).rows;
 
+      // İlk AI puanını audit_logs geçmişinden veya mevcut puandan bul (APP-05)
+      const earliestLog = (await pool.query(`
+        SELECT old_values FROM audit_logs
+        WHERE entity_type = 'assessment' AND entity_id = $1
+        ORDER BY created_at ASC LIMIT 1
+      `, [asm.id])).rows[0];
+      const originalAiScore = earliestLog?.old_values?.score !== undefined
+        ? Number(earliestLog.old_values.score)
+        : (asm.score !== null ? Number(asm.score) : null);
+
       detailedAssessments.push({
         ...asm,
+        criteria_label: asm.criteria_label || (asm.is_overall ? 'Genel Uyum' : 'Yetkinlik'),
         score: asm.score !== null ? Number(asm.score) : null,
+        original_ai_score: originalAiScore,
         evidence_items: evidence
       });
     }
 
+    // Kapsam kayıtları (Bölüm 08 & B08)
+    const coverageRecords = appInfo.session_id ? (await pool.query(`
+      SELECT cr.*, pr.label AS requirement_label, pr.required
+      FROM coverage_records cr
+      JOIN position_requirements pr ON pr.id = cr.requirement_id
+      WHERE cr.session_id = $1
+      ORDER BY pr.sort_order ASC
+    `, [appInfo.session_id])).rows : [];
+
     // Varsa itiraz bilgisi
     const appeal = (await pool.query(`
-      SELECT ap.*, u.email AS decided_by_email
+      SELECT ap.*, ap.decision_note AS reviewer_notes, ap.decided_at AS resolved_at, u.email AS decided_by_email
       FROM appeals ap
       LEFT JOIN users u ON u.id = ap.decided_by_user_id
       WHERE ap.application_id = $1
@@ -873,23 +921,38 @@ export function registerStage3(
       SELECT * FROM cv_analyses WHERE application_id = $1 ORDER BY analyzed_at DESC LIMIT 1
     `, [applicationId])).rows[0] || null;
 
+    // Denetim geçmişi (B08 / B09)
+    const auditLogs = (await pool.query(`
+      SELECT al.*, u.email AS user_email
+      FROM audit_logs al
+      LEFT JOIN users u ON u.id = al.user_id
+      WHERE al.organization_id = $1 AND (
+        al.entity_id = $2
+        OR al.entity_id IN (SELECT id FROM assessments WHERE application_id = $2)
+        OR al.entity_id IN (SELECT id FROM appeals WHERE application_id = $2)
+      )
+      ORDER BY al.created_at DESC LIMIT 30
+    `, [orgId, applicationId])).rows;
+
     res.json({
       application: appInfo,
       requirements: reqs,
       turns,
       submission,
       assessments: detailedAssessments,
+      coverage: coverageRecords,
       cv_analysis: cvAnalysis,
-      appeal
+      appeal,
+      audit_logs: auditLogs
     });
   }));
 
   // -------------------------------------------------------------
-  // ŞİRKET: İnsan Revizyonu (B09 & REP-04 / APP-04 Puan Düzeltme)
+  // ŞİRKET: İnsan Revizyonu (B09 & REP-04 / APP-04 / APP-07 Puan Düzeltme)
   // -------------------------------------------------------------
   app.post('/api/company/assessments/:assessmentId/revise', company(['admin', 'recruiter', 'reviewer']), route(async (req, res) => {
     const assessmentId = param(req.params.assessmentId);
-    const { newScore, revisionNote } = req.body || {};
+    const { newScore, revisionNote, expectedScore, expectedRevisedAt } = req.body || {};
     if (!uuidPattern.test(assessmentId)) throw new ValidationError('Geçersiz değerlendirme kimliği.');
     const numScore = Number(newScore);
     if (!Number.isFinite(numScore) || numScore < 0 || numScore > 100) {
@@ -908,7 +971,15 @@ export function registerStage3(
 
       if (!current) throw new HttpError(404, 'Değerlendirme bulunamadı.');
 
-      const oldScore = current.score;
+      // APP-07: Eşzamanlı düzenleme / sürüm çakışması kontrolü
+      if (expectedScore !== undefined && expectedScore !== null && current.score !== null && Number(current.score) !== Number(expectedScore)) {
+        throw new HttpError(409, 'Bu değerlendirme puanı başka bir yetkili tarafından eşzamanlı güncellenmiş (APP-07 Sürüm Çakışması). Lütfen sayfayı yenileyerek güncel puan üzerinden işlem yapın.');
+      }
+      if (expectedRevisedAt !== undefined && String(current.revised_at || '') !== String(expectedRevisedAt || '')) {
+        throw new HttpError(409, 'Bu değerlendirme kaydı başka bir yetkili tarafından değiştirildi (APP-07 Sürüm Çakışması). Lütfen sayfayı yenileyin.');
+      }
+
+      const oldScore = current.score !== null ? Number(current.score) : null;
 
       // Puanı güncelle
       await client.query(`
@@ -985,13 +1056,14 @@ export function registerStage3(
   }));
 
   // -------------------------------------------------------------
-  // ŞİRKET: İtirazları Listeleme ve Çözümleme (B09)
+  // ŞİRKET: İtirazları Listeleme ve Çözümleme (B09, APP-01..07)
   // -------------------------------------------------------------
   app.get('/api/company/appeals', company(), route(async (req, res) => {
     const orgId = req.session.organization_id!;
     const { rows } = await pool.query(`
       SELECT ap.id, ap.application_id, ap.reason, ap.timestamp_reference, ap.status, ap.decision, ap.decision_note,
-             ap.created_at, ap.decided_at,
+             ap.decision_note AS reviewer_notes,
+             ap.created_at, ap.decided_at, ap.decided_at AS resolved_at,
              a.candidate_name, c.email AS candidate_email,
              p.title AS position_title,
              u.email AS decided_by_email,
@@ -1005,18 +1077,52 @@ export function registerStage3(
       ORDER BY ap.created_at DESC
     `, [orgId]);
 
-    res.json({ appeals: rows });
+    const enrichedAppeals = [];
+    for (const ap of rows) {
+      const [asms, turns, logs] = await Promise.all([
+        pool.query(`
+          SELECT a.id, a.requirement_id, a.is_overall, a.score, a.weight, a.status, a.rationale, a.revision_note, a.revised_at,
+                 pr.label AS criteria_label, u.email AS revised_by_email
+          FROM assessments a
+          LEFT JOIN position_requirements pr ON pr.id = a.requirement_id
+          LEFT JOIN users u ON u.id = a.revised_by_user_id
+          WHERE a.application_id = $1
+          ORDER BY a.is_overall ASC, pr.sort_order ASC
+        `, [ap.application_id]),
+        pool.query(`
+          SELECT t.id, t.turn_number, t.speaker, t.question_text, t.transcript_text, t.audio_timestamp_start, t.audio_timestamp_end
+          FROM interview_turns t
+          JOIN interview_sessions s ON s.id = t.session_id
+          WHERE s.application_id = $1
+          ORDER BY t.turn_number ASC
+        `, [ap.application_id]),
+        pool.query(`
+          SELECT al.*, u.email AS user_email
+          FROM audit_logs al
+          LEFT JOIN users u ON u.id = al.user_id
+          WHERE al.organization_id = $1 AND (
+            al.entity_id = $2
+            OR al.entity_id IN (SELECT id FROM assessments WHERE application_id = $3)
+          )
+          ORDER BY al.created_at DESC LIMIT 20
+        `, [orgId, ap.id, ap.application_id])
+      ]);
+
+      enrichedAppeals.push({
+        ...ap,
+        assessments: asms.rows.map(x => ({ ...x, score: x.score !== null ? Number(x.score) : null })),
+        turns: turns.rows,
+        audit_logs: logs.rows
+      });
+    }
+
+    res.json({ appeals: enrichedAppeals });
   }));
 
   app.post('/api/company/appeals/:appealId/decide', company(['admin', 'reviewer']), route(async (req, res) => {
     const appealId = param(req.params.appealId);
-    const { decision, decisionNote } = req.body || {};
+    const { decision, decisionNote, expectedStatus, nextStatus, assessmentId, newScore } = req.body || {};
     if (!uuidPattern.test(appealId)) throw new ValidationError('Geçersiz itiraz kimliği.');
-    if (!['upheld', 'revised', 'additional_interview'].includes(decision)) {
-      throw new ValidationError('Geçersiz itiraz kararı (upheld, revised, additional_interview).');
-    }
-    const note = String(decisionNote || '').trim();
-    if (note.length < 5) throw new ValidationError('Lütfen karar gerekçesini belirtin.');
 
     const result = await transaction(async client => {
       const appeal = (await client.query(`
@@ -1024,6 +1130,61 @@ export function registerStage3(
       `, [appealId, req.session.organization_id])).rows[0];
 
       if (!appeal) throw new HttpError(404, 'İtiraz kaydı bulunamadı.');
+
+      // APP-07: Eşzamanlı düzenleme / sürüm çakışması kontrolü
+      if (expectedStatus && appeal.status !== expectedStatus) {
+        throw new HttpError(409, 'Bu itiraz başka bir değerlendirici tarafından eşzamanlı güncellenmiş (APP-07 Sürüm Çakışması). Lütfen sayfayı yenileyin.');
+      }
+
+      if (nextStatus === 'in_review') {
+        await client.query(`
+          UPDATE appeals SET status = 'in_review', assigned_user_id = $1 WHERE id = $2
+        `, [req.session.actor_id, appealId]);
+        return { appealId, status: 'in_review' };
+      }
+
+      if (!['upheld', 'revised', 'additional_interview'].includes(decision)) {
+        throw new ValidationError('Geçersiz itiraz kararı (upheld, revised, additional_interview).');
+      }
+      const note = String(decisionNote || '').trim();
+      if (note.length < 5) throw new ValidationError('Lütfen karar gerekçesini belirtin.');
+
+      // Eğer karar 'revised' ise ve yeni puan belirtildiyse ilgili yetkinlik puanını da tek işlemde güncelle (APP-04, APP-05)
+      if (decision === 'revised' && assessmentId && uuidPattern.test(assessmentId) && newScore !== undefined && newScore !== null && newScore !== '') {
+        const numScore = Number(newScore);
+        if (Number.isFinite(numScore) && numScore >= 0 && numScore <= 100) {
+          const targetAsm = (await client.query('SELECT score FROM assessments WHERE id = $1 AND application_id = $2 FOR UPDATE', [assessmentId, appeal.application_id])).rows[0];
+          if (targetAsm) {
+            await client.query(`
+              UPDATE assessments
+              SET score = $1, status = 'revised_by_human', revised_by_user_id = $2, revised_at = now(), revision_note = $3
+              WHERE id = $4
+            `, [numScore, req.session.actor_id, note, assessmentId]);
+
+            await client.query(`
+              INSERT INTO audit_logs (id, organization_id, user_id, action, entity_type, entity_id, old_values, new_values, rationale)
+              VALUES ($1, $2, $3, 'assessment_revision', 'assessment', $4, $5, $6, $7)
+            `, [newId(), req.session.organization_id, req.session.actor_id, assessmentId, JSON.stringify({ score: targetAsm.score }), JSON.stringify({ score: numScore }), note]);
+
+            const reqAssessments = (await client.query(`
+              SELECT score, weight FROM assessments WHERE application_id = $1 AND is_overall = false
+            `, [appeal.application_id])).rows;
+            let newOverall = 0;
+            let complete = true;
+            for (const a of reqAssessments) {
+              if (a.score === null) complete = false;
+              else newOverall += Number(a.score) * (Number(a.weight) / 100.0);
+            }
+            if (complete) {
+              newOverall = Math.round(newOverall * 10) / 10;
+              await client.query(`
+                UPDATE assessments SET score = $1, status = 'revised_by_human', revised_at = now()
+                WHERE application_id = $2 AND is_overall = true
+              `, [newOverall, appeal.application_id]);
+            }
+          }
+        }
+      }
 
       await client.query(`
         UPDATE appeals
@@ -1435,15 +1596,17 @@ export function registerStage3(
         ORDER BY title ASC
       `, [orgId]),
       pool.query(`
-        SELECT a.id, a.candidate_name, c.email, a.position_id, p.title AS position_title,
+        SELECT a.id, a.id AS application_id, a.candidate_name, c.email, a.position_id, p.title AS position_title,
                a.status AS application_status, a.created_at,
                cv.id IS NOT NULL AS has_cv, cv.review_status AS cv_review_status,
+               cva.match_status AS cv_match_status, cva.summary AS cv_summary, cva.criteria_matches,
                i.id AS invitation_id, i.status AS invitation_status, i.delivery_status,
                i.expires_at, i.estimated_minutes
         FROM applications a
         JOIN candidates c ON c.id = a.candidate_id
         JOIN positions p ON p.id = a.position_id
         LEFT JOIN cv_documents cv ON cv.application_id = a.id
+        LEFT JOIN cv_analyses cva ON cva.application_id = a.id
         LEFT JOIN LATERAL (SELECT * FROM invitations WHERE application_id = a.id ORDER BY created_at DESC LIMIT 1) i ON true
         WHERE a.organization_id = $1
         ORDER BY a.created_at DESC
@@ -1452,34 +1615,68 @@ export function registerStage3(
     ]);
 
     const orgName = orgRow.rows[0]?.name || 'Şirketimiz';
-    const defaultTemplate = {
-      subject: `Assessora Mülakat Daveti — {position_title}`,
-      body: `Sayın {candidate_name},\n\n${orgName} bünyesindeki {position_title} pozisyonu için başvurunuz değerlendirilmiş ve yapay zeka destekli teknik mülakat aşamasına davet edildiniz.\n\nMülakat bağlantınız: {link}\n\nBu bağlantı üzerinden bilgilendirme metnini inceleyebilir, kamera/mikrofon testinizi yapabilir ve mülakatınızı tamamlayabilirsiniz.\n\nBaşarılar dileriz.\n${orgName} İşe Alım Ekibi`
-    };
+    const templates = [
+      {
+        id: 'standard',
+        name: 'Standart Teknik Mülakat Daveti',
+        subject: `Assessora Mülakat Daveti — {pozisyon}`,
+        body: `Sayın {ad},\n\n${orgName} bünyesindeki {pozisyon} pozisyonu için başvurunuz değerlendirilmiş ve yapay zeka destekli teknik mülakat aşamasına davet edildiniz.\n\nMülakat bağlantınız:\n{link}\n\nSon katılım tarihi: {tarih}\n\nBaşarılar dileriz.\n${orgName} İşe Alım Ekibi`
+      },
+      {
+        id: 'senior',
+        name: 'Kıdemli Mühendislik & Vaka Görevi Daveti',
+        subject: `${orgName} Teknik Değerlendirme & Vaka Mülakatı — {pozisyon}`,
+        body: `Sayın {ad},\n\n{pozisyon} pozisyonu için özgeçmişiniz pozisyon gereksinimlerimizle yüksek uyum göstermiştir. Sesli AI görüşmesi ve uygulamalı görev oturumuna katılmak için aşağıdaki kişisel bağlantınızı kullanabilirsiniz:\n\n{link}\n\nSon katılım tarihi: {tarih}\n\nSaygılarımızla,\n${orgName}`
+      },
+      {
+        id: 'reminder',
+        name: 'Tamamlayıcı / Hatırlatma Daveti',
+        subject: `Hatırlatma: {pozisyon} AI Mülakat Oturumunuz`,
+        body: `Sayın {ad},\n\n{pozisyon} başvurunuz kapsamındaki AI mülakat oturumunuz için son katılım tarihi ({tarih}) yaklaşmaktadır. Aşağıdaki bağlantıdan kamera ve mikrofon kontrolünüzü yaparak oturuma katılabilirsiniz:\n\n{link}\n\nİyi çalışmalar dileriz,\n${orgName}`
+      }
+    ];
+
+    const candidates = applications.rows.map(row => {
+      const matches = Array.isArray(row.criteria_matches) ? row.criteria_matches : [];
+      const pct = matches.length > 0
+        ? Math.round(matches.reduce((acc: number, m: any) => acc + (m.match_level === 'full' ? 100 : m.match_level === 'partial' ? 55 : 0), 0) / matches.length)
+        : (row.cv_match_status === 'suitable' ? 88 : row.cv_match_status === 'needs_review' ? 58 : row.cv_match_status === 'unsuitable' ? 25 : null);
+      const isPreparedValid = row.invitation_id && row.invitation_status === 'prepared' && new Date(row.expires_at).getTime() > Date.now();
+      return {
+        ...row,
+        cv_match_percentage: pct,
+        test_link: isPreparedValid ? `/aday/davet/${invitationToken(row.invitation_id)}` : null
+      };
+    });
 
     res.json({
       positions: positions.rows,
-      applications: applications.rows,
-      template: defaultTemplate
+      candidates,
+      applications: candidates,
+      templates,
+      template: templates[0],
+      mailMode
     });
   }));
 
   app.post('/api/company/invitations/batch-send', company(['admin', 'recruiter']), route(async (req, res) => {
     const orgId = req.session.organization_id!;
-    const { applicationIds, estimatedMinutes, expiresAt } = req.body || {};
+    const { applicationIds, estimatedMinutes, expiresAt, expiresInDays } = req.body || {};
     if (!Array.isArray(applicationIds) || applicationIds.length === 0) {
       throw new ValidationError('En az bir aday seçilmelidir.');
     }
     const mins = Math.max(15, Math.min(120, parseInt(String(estimatedMinutes || 30), 10)));
-    const expiry = expiresAt ? new Date(expiresAt) : new Date(Date.now() + 7 * 86400000);
+    const days = Math.max(1, Math.min(30, parseInt(String(expiresInDays || 7), 10)));
+    const expiry = expiresAt ? new Date(expiresAt) : new Date(Date.now() + days * 86400000);
 
-    const createdIds: string[] = [];
+    const results: Array<{ applicationId: string; invitationId: string; candidateName: string; email: string; testLink: string }> = [];
     await transaction(async client => {
       for (const appId of applicationIds) {
         if (!uuidPattern.test(appId)) continue;
         const appRow = (await client.query(`
-          SELECT a.id, a.position_id, a.position_version, p.status AS position_status
+          SELECT a.id, a.candidate_name, c.email, a.position_id, a.position_version, p.status AS position_status
           FROM applications a
+          JOIN candidates c ON c.id = a.candidate_id
           JOIN positions p ON p.id = a.position_id
           WHERE a.id = $1 AND a.organization_id = $2
         `, [appId, orgId])).rows[0];
@@ -1487,7 +1684,7 @@ export function registerStage3(
         if (!appRow || appRow.position_status !== 'active') continue;
 
         await client.query(`
-          UPDATE invitations SET status = 'cancelled' WHERE application_id = $1 AND status = 'prepared'
+          UPDATE invitations SET status = 'cancelled', cancelled_at = now() WHERE application_id = $1 AND status = 'prepared'
         `, [appId]);
 
         const invId = newId();
@@ -1505,16 +1702,24 @@ export function registerStage3(
           UPDATE applications SET status = 'invited' WHERE id = $1
         `, [appId]);
 
-        createdIds.push(invId);
+        results.push({
+          applicationId: appRow.id,
+          invitationId: invId,
+          candidateName: appRow.candidate_name,
+          email: appRow.email,
+          testLink: `/aday/davet/${invitationToken(invId)}`
+        });
       }
 
       await client.query(`
         INSERT INTO audit_logs (id, organization_id, user_id, action, entity_type, entity_id, new_values, rationale)
         VALUES ($1, $2, $3, 'batch_invitations_sent', 'invitation', $2, $4, $5)
-      `, [newId(), orgId, req.session.actor_id, JSON.stringify({ count: createdIds.length }), `${createdIds.length} adaya toplu mülakat daveti gönderildi.`]);
+      `, [newId(), orgId, req.session.actor_id, JSON.stringify({ count: results.length }), `${results.length} adaya toplu mülakat daveti gönderildi.`]);
     });
 
-    res.json({ ok: true, count: createdIds.length });
+    void processEmailJobs().catch(() => console.error('E-posta işi işlenemedi.'));
+
+    res.json({ ok: true, count: results.length, sentCount: results.length, results });
   }));
 
   // -------------------------------------------------------------
@@ -1557,8 +1762,9 @@ export function registerStage3(
   // ADAY: Soruyu Açıklama / Derinleştirme İsteği (C07, INT-05)
   // -------------------------------------------------------------
   app.post('/api/candidate/interview/clarify', candidate, route(async (req, res) => {
-    const { sessionId, currentQuestionIndex } = req.body || {};
+    const { sessionId, currentQuestionIndex, questionIndex } = req.body || {};
     if (!sessionId || !uuidPattern.test(sessionId)) throw new ValidationError('Geçersiz oturum.');
+    const qIdx = Number.isInteger(currentQuestionIndex) ? currentQuestionIndex : (Number.isInteger(questionIndex) ? questionIndex : 0);
 
     const session = (await pool.query(`
       SELECT s.*, p.title AS position_title, a.position_id, a.position_version
@@ -1578,12 +1784,13 @@ export function registerStage3(
     `, [session.position_id, session.position_version])).rows[0];
 
     const questions = plan?.questions || [];
-    const currentQ = questions[currentQuestionIndex] || questions[0];
+    const currentQ = questions[qIdx] || questions[0];
 
     const clarificationText = `Bu soruda değerlendirmek istediğimiz ana nokta: ${currentQ?.requirement_label || 'ilgili yetkinlik'} alanındaki tecrübenizi, projelerinizde aldığınız mimari veya pratik kararlar ve bunların sonuçları çerçevesinde özetlemenizdir. İstediğiniz bir proje detayından başlayabilirsiniz.`;
 
     res.json({
       clarificationText,
+      clarification: clarificationText,
       questionText: currentQ?.question_text
     });
   }));

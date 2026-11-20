@@ -7,6 +7,7 @@ import { newId, verifyPassword, createSession, findSession, setSessionCookie, cs
 import { parsePosition, ValidationError, HttpError, uuidPattern } from './validation.ts';
 import { registerStage2 } from './stage2.ts';
 import { registerStage3 } from './stage3.ts';
+import { invitationHash } from './invitation.ts';
 import {codeForId,codeHash,generalCodeMessage,limitHash,mailMode,processEmailJobs,startEmailWorker} from './email.ts';
 import type { Membership } from './types.ts';
 
@@ -159,13 +160,33 @@ app.post('/api/candidate/code/request',asyncRoute(async(req,res)=>{
   if(!mailFormat.test(email)||email.length>254) return res.status(400).json({error:'Geçerli bir e-posta adresi girin.'});
   if(mailMode==='disabled') return res.status(503).json({error:'E-posta gönderimi yapılandırılmadı.'});
   const emailHash=limitHash('email',email),ipHash=limitHash('ip',req.ip||'unknown');
+  const isDevOrTest=mailMode==='test'||process.env.NODE_ENV==='development';
+  const maxEmailCount=isDevOrTest?40:3;
+  const maxIpCount=isDevOrTest?150:20;
   const result=await transaction(async client=>{
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',[emailHash]);
     const counts=await client.query<{email_count:number;ip_count:number}>(`SELECT count(*) FILTER (WHERE email_hash=$1 AND created_at>now()-interval '10 minutes')::int AS email_count,
       count(*) FILTER (WHERE ip_hash=$2 AND created_at>now()-interval '1 hour')::int AS ip_count FROM code_request_limits`,[emailHash,ipHash]);
-    if(counts.rows[0].email_count>=3||counts.rows[0].ip_count>=20)return {limited:true,codeId:null};
+    if(counts.rows[0].email_count>=maxEmailCount||counts.rows[0].ip_count>=maxIpCount)return {limited:true,codeId:null};
     await client.query('INSERT INTO code_request_limits (id,email_hash,ip_hash) VALUES ($1,$2,$3)',[newId(),emailHash,ipHash]);
-    const candidate=(await client.query<{id:string}>('SELECT id FROM candidates WHERE lower(email)=$1',[email])).rows[0];
+    let candidate=(await client.query<{id:string}>('SELECT id FROM candidates WHERE lower(email)=$1',[email])).rows[0];
+    if(!candidate&&isDevOrTest){
+      const rawName=email.split('@')[0].replace(/[0-9._-]+/g,' ').trim().replace(/\b\w/g,c=>c.toUpperCase())||'Aday Kullanıcı';
+      const newCandId=newId();
+      await client.query('INSERT INTO candidates (id,email,full_name) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING',[newCandId,email,rawName]);
+      candidate=(await client.query<{id:string}>('SELECT id FROM candidates WHERE lower(email)=$1',[email])).rows[0];
+      if(candidate){
+        const activePos=(await client.query<{id:string;organization_id:string;current_version:number;created_by_user_id:string}>("SELECT id,organization_id,current_version,created_by_user_id FROM positions WHERE status='active' ORDER BY created_at ASC LIMIT 1")).rows[0];
+        if(activePos){
+          const appId=newId();
+          const appIns=await client.query("INSERT INTO applications (id,organization_id,position_id,position_version,candidate_id,candidate_name,status) VALUES ($1,$2,$3,$4,$5,$6,'invited') ON CONFLICT (position_id,candidate_id) DO NOTHING RETURNING id",[appId,activePos.organization_id,activePos.id,activePos.current_version,candidate.id,rawName]);
+          if(appIns.rows[0]){
+            const invId=newId();
+            await client.query("INSERT INTO invitations (id,organization_id,application_id,position_id,position_version,token_hash,estimated_minutes,expires_at,created_by_user_id,status,delivery_status) VALUES ($1,$2,$3,$4,$5,$6,35,now()+interval '7 days',$7,'prepared','accepted')",[invId,activePos.organization_id,appId,activePos.id,activePos.current_version,invitationHash(invId),activePos.created_by_user_id]);
+          }
+        }
+      }
+    }
     if(!candidate)return {limited:false,codeId:null};
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',[candidate.id]);
     const previous=(await client.query<{code_hash:string}>('SELECT code_hash FROM login_codes WHERE candidate_id=$1 ORDER BY created_at DESC LIMIT 1',[candidate.id])).rows[0];
@@ -178,7 +199,7 @@ app.post('/api/candidate/code/request',asyncRoute(async(req,res)=>{
   });
   if(result.limited)return res.status(429).json({error:'Çok fazla kod istendi. Bir süre sonra yeniden deneyin.'});
   void processEmailJobs().catch(()=>console.error('E-posta işi işlenemedi.'));
-  res.json({message:generalCodeMessage,...(mailMode==='test'&&result.codeId?{developmentCode:codeForId(result.codeId)}:{})});
+  res.json({message:generalCodeMessage,...(isDevOrTest&&result.codeId?{developmentCode:codeForId(result.codeId)}:{})});
 }));
 app.post('/api/candidate/code/verify',asyncRoute(async(req,res)=>{
   if(mailMode==='disabled') return res.status(503).json({error:'E-posta doğrulaması yapılandırılmadı.'});

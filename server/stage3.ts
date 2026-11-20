@@ -114,9 +114,10 @@ export function registerStage3(
     if (!invitationId) throw new HttpError(404, 'Geçersiz davet bağlantısı.');
 
     const inv = (await pool.query<{ id: string; candidate_id: string; candidate_email: string; status: string; expires_at: string }>(`
-      SELECT i.id, i.candidate_id, i.status, i.expires_at, c.email AS candidate_email
+      SELECT i.id, a.candidate_id, i.status, i.expires_at, c.email AS candidate_email
       FROM invitations i
-      JOIN candidates c ON c.id = i.candidate_id
+      JOIN applications a ON a.id = i.application_id AND a.organization_id = i.organization_id
+      JOIN candidates c ON c.id = a.candidate_id
       WHERE i.id = $1 AND i.token_hash = $2
     `, [invitationId, invitationHash(invitationId)])).rows[0];
 
@@ -170,8 +171,9 @@ export function registerStage3(
     }
 
     const inv = (await pool.query<{ id: string; candidate_id: string; status: string; expires_at: string }>(`
-      SELECT i.id, i.candidate_id, i.status, i.expires_at
+      SELECT i.id, a.candidate_id, i.status, i.expires_at
       FROM invitations i
+      JOIN applications a ON a.id = i.application_id AND a.organization_id = i.organization_id
       WHERE i.id = $1 AND i.token_hash = $2
     `, [invitationId, invitationHash(invitationId)])).rows[0];
 
@@ -259,28 +261,15 @@ export function registerStage3(
           SELECT * FROM interview_plans WHERE position_id = $1 AND position_version = $2
         `, [inv.position_id, inv.position_version])).rows[0];
 
-        const cvRow = (await client.query(`
-          SELECT extracted_projects FROM cv_analyses WHERE application_id = $1
-        `, [inv.application_id])).rows[0];
-        const candidateProjects = (cvRow?.extracted_projects as Array<{ title?: string; source_citation?: string }>) || [];
-
         if (!plan) {
-          const generatedQuestions = reqs.map((r, idx) => {
-            const proj = candidateProjects[idx % Math.max(1, candidateProjects.length)];
-            const hasProject = Boolean(proj && proj.title);
-            const questionText = hasProject
-              ? `Özgeçmişinizde yer alan "${proj.title}" projesi kapsamında, ${r.label} yetkinliğinizi nasıl uyguladınız? Karşılaştığınız temel zorluklar ve mimari tercihleriniz neler oldu?`
-              : `${r.label} konusundaki tecrübelerinizi somut bir proje örneği üzerinden anlatır mısınız? Hangi zorluklarla karşılaştınız ve nasıl çözdünüz?`;
-            return {
+          const generatedQuestions = reqs.map((r, idx) => ({
               id: newId(),
               requirement_id: r.id,
               requirement_label: r.label,
               order: idx + 1,
-              question_text: questionText,
+              question_text: `${r.label} yetkinliğinizi iş veya proje deneyiminizde nasıl kullandığınızı anlatır mısınız? Karşılaştığınız önemli bir zorluğu ve çözüm yaklaşımınızı örnekle açıklar mısınız?`,
               followup_template: `${r.label} alanında uyguladığınız kararların sistem performansına ve mimariye etkileri neler oldu?`,
-              source_citation: proj?.source_citation || null
-            };
-          });
+          }));
 
           const taskTemplate = {
             title: `${inv.position_title} Uygulamalı Değerlendirme Görevi`,
@@ -313,9 +302,29 @@ export function registerStage3(
       }
 
       // Plan ve soruları getir
-      const plan = (await client.query(`
-        SELECT questions, task_template FROM interview_plans WHERE position_id = $1 AND position_version = $2
+      let plan = (await client.query(`
+        SELECT id, questions, task_template, is_approved FROM interview_plans WHERE position_id = $1 AND position_version = $2
       `, [inv.position_id, inv.position_version])).rows[0];
+
+      // Eski otomatik planlar CV'deki herhangi bir projeyi her yetkinliğe
+      // bağlayabiliyordu. Bu işaretli, onaylanmamış planları tutarlı sorularla yenile.
+      if (!plan?.is_approved && Array.isArray(plan?.questions) && plan.questions.some((q: any) => Object.hasOwn(q, 'source_citation'))) {
+        const planRequirements = (await client.query(`
+          SELECT id, label FROM position_requirements
+          WHERE position_id = $1 AND version_no = $2
+          ORDER BY sort_order ASC
+        `, [inv.position_id, inv.position_version])).rows;
+        const questions = planRequirements.map((r, idx) => ({
+          id: newId(),
+          requirement_id: r.id,
+          requirement_label: r.label,
+          order: idx + 1,
+          question_text: `${r.label} yetkinliğinizi iş veya proje deneyiminizde nasıl kullandığınızı anlatır mısınız? Karşılaştığınız önemli bir zorluğu ve çözüm yaklaşımınızı örnekle açıklar mısınız?`,
+          followup_template: `${r.label} alanında uyguladığınız kararların sistem performansına ve mimariye etkileri neler oldu?`
+        }));
+        await client.query(`UPDATE interview_plans SET questions = $1 WHERE id = $2`, [JSON.stringify(questions), plan.id]);
+        plan = { ...plan, questions };
+      }
 
       // Konuşma turlarını getir
       const turns = (await client.query(`

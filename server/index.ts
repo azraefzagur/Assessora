@@ -3,7 +3,7 @@ import express, { type Request, type Response, type NextFunction } from 'express
 import multer from 'multer';
 import { resolve } from 'node:path';
 import { pool, transaction } from './db.ts';
-import { newId, verifyPassword, createSession, findSession, setSessionCookie, csrfValid } from './security.ts';
+import { newId, hashPassword, verifyPassword, createSession, findSession, setSessionCookie, csrfValid } from './security.ts';
 import { parsePosition, ValidationError, HttpError, uuidPattern } from './validation.ts';
 import { registerStage2 } from './stage2.ts';
 import { registerStage3 } from './stage3.ts';
@@ -14,6 +14,10 @@ import type { Membership } from './types.ts';
 const app=express();
 app.disable('x-powered-by');
 if(process.env.TRUST_PROXY==='true') app.set('trust proxy',1);
+app.get('/health',async(_req,res)=>{
+  try{await pool.query('SELECT 1');res.status(200).json({ok:true});}
+  catch{res.status(503).json({ok:false});}
+});
 app.use(express.json({limit:'30kb'}));
 const mailFormat=/^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -72,6 +76,23 @@ app.post('/api/company/login',asyncRoute(async(req,res)=>{
   if(!rows[0]||!verifyPassword(password,rows[0].password_hash)) return res.status(401).json({error:'E-posta veya şifre hatalı.'});
   await rotate(req,res,'company',rows[0].id,rows[0].organization_id);
   res.json({ok:true});
+}));
+app.post('/api/company/register',asyncRoute(async(req,res)=>{
+  const organizationName=String(req.body?.organizationName||'').trim();
+  const email=String(req.body?.email||'').trim().toLowerCase();
+  const password=String(req.body?.password||'');
+  if(organizationName.length<2||organizationName.length>160) return res.status(400).json({error:'Şirket adı 2–160 karakter arasında olmalı.'});
+  if(!mailFormat.test(email)||email.length>254) return res.status(400).json({error:'Geçerli bir e-posta adresi girin.'});
+  if(password.length<12||password.length>128) return res.status(400).json({error:'Şifre 12–128 karakter arasında olmalı.'});
+  const userId=newId(),organizationId=newId();
+  await transaction(async client=>{
+    await client.query('INSERT INTO organizations (id,name) VALUES ($1,$2)',[organizationId,organizationName]);
+    const user=await client.query('INSERT INTO users (id,email,password_hash,development_only) VALUES ($1,$2,$3,false) ON CONFLICT DO NOTHING RETURNING id',[userId,email,hashPassword(password)]);
+    if(!user.rows[0]) throw new HttpError(409,'Bu e-posta adresi zaten şirket hesabında kullanılıyor. Giriş yapmayı deneyin.');
+    await client.query("INSERT INTO memberships (id,organization_id,user_id,role,active) VALUES ($1,$2,$3,'admin',true)",[newId(),organizationId,userId]);
+  });
+  await rotate(req,res,'company',userId,organizationId);
+  res.status(201).json({ok:true});
 }));
 app.post('/api/logout',asyncRoute(async(req,res)=>{
   await pool.query('DELETE FROM sessions WHERE id_hash=$1',[req.session.id_hash]);
@@ -160,7 +181,7 @@ app.post('/api/candidate/code/request',asyncRoute(async(req,res)=>{
   if(!mailFormat.test(email)||email.length>254) return res.status(400).json({error:'Geçerli bir e-posta adresi girin.'});
   if(mailMode==='disabled') return res.status(503).json({error:'E-posta gönderimi yapılandırılmadı.'});
   const emailHash=limitHash('email',email),ipHash=limitHash('ip',req.ip||'unknown');
-  const isDevOrTest=mailMode==='test'||process.env.NODE_ENV==='development';
+  const isDevOrTest=mailMode==='test';
   const maxEmailCount=isDevOrTest?40:3;
   const maxIpCount=isDevOrTest?150:20;
   const result=await transaction(async client=>{
@@ -170,12 +191,12 @@ app.post('/api/candidate/code/request',asyncRoute(async(req,res)=>{
     if(counts.rows[0].email_count>=maxEmailCount||counts.rows[0].ip_count>=maxIpCount)return {limited:true,codeId:null};
     await client.query('INSERT INTO code_request_limits (id,email_hash,ip_hash) VALUES ($1,$2,$3)',[newId(),emailHash,ipHash]);
     let candidate=(await client.query<{id:string}>('SELECT id FROM candidates WHERE lower(email)=$1',[email])).rows[0];
-    if(!candidate&&isDevOrTest){
+    if(!candidate){
       const rawName=email.split('@')[0].replace(/[0-9._-]+/g,' ').trim().replace(/\b\w/g,c=>c.toUpperCase())||'Aday Kullanıcı';
       const newCandId=newId();
       await client.query('INSERT INTO candidates (id,email,full_name) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING',[newCandId,email,rawName]);
       candidate=(await client.query<{id:string}>('SELECT id FROM candidates WHERE lower(email)=$1',[email])).rows[0];
-      if(candidate){
+      if(candidate&&mailMode==='test'){
         const activePos=(await client.query<{id:string;organization_id:string;current_version:number;created_by_user_id:string}>("SELECT id,organization_id,current_version,created_by_user_id FROM positions WHERE status='active' ORDER BY created_at ASC LIMIT 1")).rows[0];
         if(activePos){
           const appId=newId();
@@ -199,7 +220,7 @@ app.post('/api/candidate/code/request',asyncRoute(async(req,res)=>{
   });
   if(result.limited)return res.status(429).json({error:'Çok fazla kod istendi. Bir süre sonra yeniden deneyin.'});
   void processEmailJobs().catch(()=>console.error('E-posta işi işlenemedi.'));
-  res.json({message:generalCodeMessage,...(isDevOrTest&&result.codeId?{developmentCode:codeForId(result.codeId)}:{})});
+  res.json({message:generalCodeMessage,...(mailMode==='test'&&result.codeId?{developmentCode:codeForId(result.codeId)}:{})});
 }));
 app.post('/api/candidate/code/verify',asyncRoute(async(req,res)=>{
   if(mailMode==='disabled') return res.status(503).json({error:'E-posta doğrulaması yapılandırılmadı.'});
@@ -235,9 +256,10 @@ app.use((error:unknown,_req:Request,res:Response,_next:NextFunction)=>{
   if(error instanceof multer.MulterError) return res.status(error.code==='LIMIT_FILE_SIZE'?413:400).json({error:error.code==='LIMIT_FILE_SIZE'?'PDF en fazla 5 MB olabilir.':'Dosya yükleme sınırı aşıldı.'});
   console.error(error);res.status(500).json({error:'Sunucu hatası.'});
 });
-const port=Number(process.env.API_PORT||3001);
+const port=Number(process.env.PORT||process.env.API_PORT||3001);
 if(!Number.isInteger(port)||port<1||port>65535) throw new Error('API_PORT geçersiz');
+const host=process.env.API_HOST||(process.env.NODE_ENV==='production'?'0.0.0.0':'127.0.0.1');
 await pool.query('SELECT name FROM schema_migrations LIMIT 1');
 await pool.query('SELECT id FROM email_jobs LIMIT 1');
 startEmailWorker();
-app.listen(port,'127.0.0.1',()=>console.log(`API: http://127.0.0.1:${port}`));
+app.listen(port,host,()=>console.log(`API: http://${host}:${port}`));

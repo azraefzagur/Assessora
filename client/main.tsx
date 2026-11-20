@@ -49,7 +49,7 @@ const statusLabel = (value: string) => ({
 const deliveryLabel = (value: string, mode?: string) =>
   value === 'accepted' && mode === 'test'
     ? 'Test taşıyıcısı kabul etti; gerçek e-posta gönderilmedi'
-    : ({ not_sent: 'E-posta gönderimi başlatılmadı', pending: 'Gönderim bekliyor', sending: 'Gönderiliyor', accepted: 'E-posta sağlayıcısı kabul etti; gelen kutusuna teslim doğrulanmadı', failed: 'Gönderim başarısız', uncertain: 'Gönderim sonucu belirsiz; otomatik tekrar edilmiyor' } as Record<string, string>)[value] || value;
+    : ({ not_sent: 'E-posta gönderimi başlatılmadı', pending: 'Gönderim sıraya alındı', sending: 'Gönderiliyor', accepted: 'Gönderildi (e-posta sağlayıcısı kabul etti)', failed: 'Gönderim başarısız', uncertain: 'Gönderim sonucu belirsiz; otomatik tekrar edilmiyor' } as Record<string, string>)[value] || value;
 
 function App() {
   const [session, setSession] = useState<Session | null>(null);
@@ -103,12 +103,20 @@ function RequireCandidateReturn() {
 }
 
 function Login({ kind, csrf, refresh, mailMode }: { kind: 'company' | 'candidate'; csrf: string; refresh: () => Promise<void>; mailMode: Session['mailMode'] }) {
-  const navigate = useNavigate(), [email, setEmail] = useState(''), [password, setPassword] = useState(''), [error, setError] = useState(''), [busy, setBusy] = useState(false);
+  const navigate = useNavigate(), [email, setEmail] = useState(''), [password, setPassword] = useState(''), [organizationName, setOrganizationName] = useState(''), [companyRegister, setCompanyRegister] = useState(false), [error, setError] = useState(''), [busy, setBusy] = useState(false);
+  const submitLock = useRef(false);
   const company = kind === 'company';
   async function submit(event: React.FormEvent) {
-    event.preventDefault(); setBusy(true); setError('');
+    event.preventDefault();
+    if (submitLock.current) return;
+    submitLock.current = true;
+    setBusy(true); setError('');
     try {
-      if (company) { await request('/api/company/login', csrf, { email, password }); await refresh(); navigate('/sirket'); }
+      if (company) {
+        if (companyRegister) await request('/api/company/register', csrf, { organizationName, email, password });
+        else await request('/api/company/login', csrf, { email, password });
+        await refresh(); navigate('/sirket');
+      }
       else {
         const result = await request<{ developmentCode?: string }>('/api/candidate/code/request', csrf, { email });
         sessionStorage.setItem('candidate_email', email);
@@ -116,7 +124,7 @@ function Login({ kind, csrf, refresh, mailMode }: { kind: 'company' | 'candidate
         else sessionStorage.removeItem('candidate_dev_code');
         navigate('/aday/dogrula', { state: { developmentCode: result.developmentCode } });
       }
-    } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+    } catch (e) { setError((e as Error).message); } finally { submitLock.current = false; setBusy(false); }
   }
   return (
     <div className="auth-page">
@@ -128,45 +136,26 @@ function Login({ kind, csrf, refresh, mailMode }: { kind: 'company' | 'candidate
       <section className="auth-panel">
         <div className="auth-box">
           <div className="card">
-            <h2>{company ? 'Şirket hesabı' : 'Aday girişi'}</h2>
-            <p className="muted">{company ? 'Kurumsal e-postanız ve şifrenizle devam edin.' : mailMode === 'test' ? 'Yerel test modunda doğrulama kodu sonraki ekranda anında gösterilir ve tek tıkla doldurulabilir.' : mailMode === 'smtp' ? 'Kayıtlı adresinize gönderilecek kodla giriş yapın.' : 'E-posta gönderimi henüz yapılandırılmadı.'}</p>
+            <h2>{company ? companyRegister ? 'Şirket hesabı oluştur' : 'Şirket hesabı' : 'Aday girişi'}</h2>
+            <p className="muted">{company ? companyRegister ? 'Şirketiniz için yeni bir çalışma alanı ve yönetici hesabı oluşturun.' : 'Kurumsal e-postanız ve şifrenizle devam edin.' : mailMode === 'test' ? 'Gerçek e-posta teslimatı için SMTP ayarları gereklidir. Ayarlar tamamlandığında kod bu adrese gönderilir.' : mailMode === 'smtp' ? 'E-posta adresinize tek kullanımlık bir giriş kodu göndereceğiz.' : 'E-posta gönderimi henüz yapılandırılmadı.'}</p>
             {error && <div className="error" role="alert">{error}</div>}
             <form onSubmit={submit}>
+              {company && companyRegister && <>
+                <label htmlFor="organizationName">Şirket adı</label>
+                <input id="organizationName" value={organizationName} onChange={e => setOrganizationName(e.target.value)} autoComplete="organization" maxLength={160} placeholder="Ör. Örnek Teknoloji A.Ş." required />
+              </>}
               <label htmlFor="email">E-posta adresi</label>
-              <input id="email" type="email" value={email} onChange={e => setEmail(e.target.value)} autoComplete="email" placeholder={company ? 'yonetici@ornek.local' : 'ornek@eposta.com'} required />
+              <input id="email" type="email" value={email} onChange={e => setEmail(e.target.value)} autoComplete="email" maxLength={254} placeholder={company ? 'yonetici@ornek.local' : 'ornek@eposta.com'} required />
               {company && <>
                 <label htmlFor="password">Şifre</label>
-                <input id="password" type="password" value={password} onChange={e => setPassword(e.target.value)} autoComplete="current-password" required />
+                <input id="password" type="password" value={password} onChange={e => setPassword(e.target.value)} autoComplete={companyRegister ? 'new-password' : 'current-password'} minLength={companyRegister ? 12 : undefined} maxLength={128} required />
+                {companyRegister && <small className="muted">En az 12 karakter kullanın. E-posta adresi doğrulanmadan hesap açılır.</small>}
               </>}
-              <button className="button" disabled={busy || (!company && mailMode === 'disabled')}>{company ? 'Giriş yap' : 'Doğrulama kodu gönder'}</button>
+              <button className="button" disabled={busy || (!company && mailMode !== 'smtp')}>{company ? busy ? 'İşleniyor…' : companyRegister ? 'Şirket hesabı oluştur' : 'Giriş yap' : 'Doğrulama kodu gönder'}</button>
             </form>
 
-            {!company && (
-              <div style={{ marginTop: '16px', paddingTop: '12px', borderTop: '1px solid #e2e8f0', textAlign: 'left' }}>
-                <div className="muted" style={{ fontSize: '11px', marginBottom: '6px', fontWeight: 600 }}>
-                  ⚡ Hızlı Demo Aday Seçimi (veya kendi e-postanızı yazabilirsiniz):
-                </div>
-                <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
-                  {[
-                    { label: 'Ahmet (76.0)', mail: 'ahmet.yilmaz@example.com' },
-                    { label: 'Zeynep (75.5)', mail: 'zeynep.kaya@example.com' },
-                    { label: 'Ece (İtiraz)', mail: 'ece.celik@example.com' },
-                    { label: 'Burak (Kesinti C12)', mail: 'burak.demir@example.com' },
-                    { label: 'Selin (Eksik Kanıt)', mail: 'selin.arslan@example.com' }
-                  ].map(demo => (
-                    <button
-                      key={demo.mail}
-                      type="button"
-                      className="button secondary"
-                      style={{ fontSize: '11px', padding: '4px 8px' }}
-                      onClick={() => setEmail(demo.mail)}
-                    >
-                      {demo.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
+            {company && <button className="button secondary" type="button" style={{ marginTop: '12px' }} disabled={busy} onClick={() => { setCompanyRegister(value => !value); setError(''); }}>{companyRegister ? 'Zaten hesabınız var mı? Giriş yapın' : 'Yeni şirket hesabı oluştur'}</button>}
+
           </div>
           <p><Link to={company ? '/aday/giris' : '/sirket/giris'}>{company ? 'Aday girişi →' : '← Şirket girişi'}</Link></p>
         </div>
@@ -186,7 +175,6 @@ function CandidateVerify({ csrf }: { csrf: string; refresh: () => Promise<void> 
   const [busy, setBusy] = useState(false);
   const [countdown, setCountdown] = useState(15);
   const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
-  const autoRequestedRef = useRef(false);
 
   useEffect(() => {
     if (countdown > 0) {
@@ -198,21 +186,6 @@ function CandidateVerify({ csrf }: { csrf: string; refresh: () => Promise<void> 
   useEffect(() => {
     inputRefs.current[0]?.focus();
   }, []);
-
-  // Eğer sayfada henüz kod yoksa (ör. sayfa yenilendiyse veya yeni aday kaydıysa) otomatik olarak kodu üret ve ekranda göster
-  useEffect(() => {
-    if (!email || developmentCode || !csrf) return;
-    let cancelled = false;
-    request<{ message: string; developmentCode?: string }>('/api/candidate/code/request', csrf, { email })
-      .then(res => {
-        if (!cancelled && res.developmentCode) {
-          setDevelopmentCode(res.developmentCode);
-          sessionStorage.setItem('candidate_dev_code', res.developmentCode);
-        }
-      })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [email, developmentCode, csrf]);
 
   if (!email) return <Navigate to="/aday/giris" />;
 
@@ -440,8 +413,7 @@ function CompanyHome() {
     <>
       <div className="heading">
         <div>
-          <h1>Genel Bakış (B02)</h1>
-          <p className="muted">{data.organization} için yapay zeka destekli mülakat ve değerlendirme çalışma alanı.</p>
+          <h1>{data.organization}</h1>
         </div>
         {data.role !== 'reviewer' && (
           <div className="actions">
@@ -925,12 +897,12 @@ function CompanyApplicationDetail({ csrf }: { csrf: string }) {
             <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
               <a className="button secondary" href={`/api/company/applications/${id}/cv`} target="_blank" rel="noreferrer">PDF Belgesini Aç</a>
               <button type="button" className="button" disabled={analyzing} onClick={handleAnalyzeCv} style={{ background: '#0284c7', borderColor: '#0284c7' }}>
-                {analyzing ? 'Analiz Yapılıyor…' : cvAnalysis ? 'Yeniden Analiz Et' : 'CV’yi Analiz Et (B05)'}
+                {analyzing ? 'Analiz Yapılıyor…' : cvAnalysis ? 'Yeniden Analiz Et' : 'CV’yi Analiz Et'}
               </button>
             </div>
           </> : <>
             <p className="muted">Henüz CV yüklenmedi.</p>
-            {canEdit && <form onSubmit={upload}><label htmlFor="cv-file">PDF dosyası (en fazla 5 MB)</label><input id="cv-file" type="file" accept=".pdf,application/pdf" onChange={e => setFile(e.target.files?.[0] || null)} required /><div className="actions"><button className="button" disabled={busy}>CV yükle</button></div></form>}
+            {canEdit && <form className="stacked-form" onSubmit={upload}><label htmlFor="cv-file">PDF dosyası (en fazla 5 MB)</label><input id="cv-file" type="file" accept=".pdf,application/pdf" onChange={e => setFile(e.target.files?.[0] || null)} required /><div className="actions"><button className="button" disabled={busy}>CV yükle</button></div></form>}
           </>}
         </div>
         <div className="card">
@@ -941,7 +913,7 @@ function CompanyApplicationDetail({ csrf }: { csrf: string }) {
             <Link className="button secondary" to={`/sirket/davetler/${data.invitation_id}`}>Davet önizlemesi</Link>
           </> : <p className="muted">Henüz davet hazırlanmadı.</p>}
           {canEdit && !open && data.position_status === 'active' && (
-            <form onSubmit={invite} style={{ marginTop: '16px' }}>
+            <form className="stacked-form" onSubmit={invite} style={{ marginTop: '16px' }}>
               <label htmlFor="duration">Görüşme süresi (dakika)</label>
               <input id="duration" type="number" min={15} max={120} value={duration} onChange={e => setDuration(Number(e.target.value))} required />
               <label htmlFor="deadline">Son katılım tarihi</label>
@@ -1431,6 +1403,11 @@ function CompanyInvitationPreview({ csrf }: { csrf: string }) {
   const { id } = useParams(), [data, setData] = useState<{ id: string; status: string; delivery_status: string; estimated_minutes: number; expires_at: string; candidate_name: string; email: string; position_title: string; organization_name: string; application_id: string; test_link: string | null; preview_link: string | null; mail_mode: string } | null>(null), [error, setError] = useState(''), [copied, setCopied] = useState(false), [busy, setBusy] = useState(false);
   const reload = () => request<typeof data>(`/api/company/invitations/${id}`).then(setData);
   useEffect(() => { reload().catch(e => setError(e.message)); }, [id]);
+  useEffect(() => {
+    if (!data || !['pending', 'sending'].includes(data.delivery_status)) return;
+    const timer = window.setInterval(() => { reload().catch(e => setError(e.message)); }, 1000);
+    return () => window.clearInterval(timer);
+  }, [id, data?.delivery_status]);
   async function cancel() { setError(''); try { await request(`/api/company/invitations/${id}/cancel`, csrf, {}); await reload(); } catch (e) { setError((e as Error).message); } }
   async function send() { setBusy(true); setError(''); try { await request(`/api/company/invitations/${id}/send`, csrf, {}); await reload(); } catch (e) { setError((e as Error).message); } finally { setBusy(false); } }
   if (error && !data) return <LoadError error={error} />; if (!data) return <p>Yükleniyor…</p>;
@@ -1673,6 +1650,7 @@ function CandidateInterviewRoom({ csrf }: { csrf: string }) {
 
   // C06 Cihaz Kontrolü & Video Akışı
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
   const [cameraActive, setCameraActive] = useState(false);
   const [micActive, setMicActive] = useState(false);
   const [micLevel, setMicLevel] = useState(0);
@@ -1767,24 +1745,32 @@ function CandidateInterviewRoom({ csrf }: { csrf: string }) {
   };
 
   // Mikrofon Ses Seviyesi Ölçümü (Web Audio API)
-  const setupAudioMeter = (stream: MediaStream) => {
+  const setupAudioMeter = (stream: MediaStream, ctx: AudioContext) => {
     try {
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      const ctx = new AudioCtx();
       const analyser = ctx.createAnalyser();
       const source = ctx.createMediaStreamSource(stream);
       source.connect(analyser);
-      analyser.fftSize = 256;
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.8;
       audioContextRef.current = ctx;
       analyserRef.current = analyser;
 
-      const buffer = new Uint8Array(analyser.frequencyBinCount);
+      const buffer = new Uint8Array(analyser.fftSize);
+      let lastUpdate = 0;
       const updateMeter = () => {
-        analyser.getByteFrequencyData(buffer);
+        analyser.getByteTimeDomainData(buffer);
         let sum = 0;
-        for (let i = 0; i < buffer.length; i++) sum += buffer[i];
-        const avg = sum / buffer.length;
-        setMicLevel(Math.min(100, Math.round((avg / 128) * 100)));
+        for (let i = 0; i < buffer.length; i++) {
+          const sample = (buffer[i] - 128) / 128;
+          sum += sample * sample;
+        }
+        const rms = Math.sqrt(sum / buffer.length);
+        const decibels = 20 * Math.log10(Math.max(rms, 0.00001));
+        const now = performance.now();
+        if (now - lastUpdate >= 80) {
+          setMicLevel(Math.min(100, Math.max(0, Math.round((decibels + 55) * 2.2))));
+          lastUpdate = now;
+        }
         animFrameRef.current = requestAnimationFrame(updateMeter);
       };
       updateMeter();
@@ -1818,6 +1804,8 @@ function CandidateInterviewRoom({ csrf }: { csrf: string }) {
 
     return () => {
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      cameraStreamRef.current?.getTracks().forEach(t => t.stop());
+      cameraStreamRef.current = null;
       if (audioContextRef.current) audioContextRef.current.close().catch(() => {});
       if (typeof window !== 'undefined' && 'speechSynthesis' in window) window.speechSynthesis.cancel();
       if (recognitionRef.current) recognitionRef.current.stop();
@@ -1826,6 +1814,13 @@ function CandidateInterviewRoom({ csrf }: { csrf: string }) {
 
   // C12: Ağ Kesintisi Takibi ve Kurtarma Modu
   const [networkAlert, setNetworkAlert] = useState('');
+  useEffect(() => {
+    const video = videoRef.current;
+    const stream = cameraStreamRef.current;
+    if (!video || !stream || !cameraActive) return;
+    if (video.srcObject !== stream) video.srcObject = stream;
+    video.play().catch(() => {});
+  }, [step, cameraActive]);
   useEffect(() => {
     const handleOffline = () => {
       setNetworkAlert('⚠️ İnternet bağlantısı kesildi. Oturum koruma moduna alınıyor...');
@@ -1872,18 +1867,31 @@ function CandidateInterviewRoom({ csrf }: { csrf: string }) {
   const toggleCamera = async () => {
     try {
       if (cameraActive) {
-        if (videoRef.current?.srcObject) {
-          (videoRef.current.srcObject as MediaStream).getTracks().forEach(t => t.stop());
-          videoRef.current.srcObject = null;
-        }
+        cameraStreamRef.current?.getTracks().forEach(t => t.stop());
+        cameraStreamRef.current = null;
+        if (videoRef.current) videoRef.current.srcObject = null;
         setCameraActive(false);
         setMicActive(false);
+        if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+        animFrameRef.current = null;
+        analyserRef.current = null;
+        if (audioContextRef.current) await audioContextRef.current.close().catch(() => {});
+        audioContextRef.current = null;
+        setMicLevel(0);
       } else {
+        const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+        const ctx = new AudioCtx();
+        audioContextRef.current = ctx;
+        if (ctx.state !== 'running') await ctx.resume();
         const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-        if (videoRef.current) videoRef.current.srcObject = stream;
+        cameraStreamRef.current = stream;
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          await videoRef.current.play().catch(() => {});
+        }
         setCameraActive(true);
         setMicActive(true);
-        setupAudioMeter(stream);
+        setupAudioMeter(stream, ctx);
       }
     } catch {
       setError('Kamera veya mikrofona erişilemedi. Tarayıcı izinlerini kontrol edin.');
@@ -2114,6 +2122,15 @@ function CandidateInterviewRoom({ csrf }: { csrf: string }) {
             {/* 2. Konuşmacı: Aday Kamerası */}
             <div className={`speaker-card ${!isSpeakingAi && micLevel > 15 ? 'active-speaker' : ''}`}>
               <video ref={videoRef} autoPlay playsInline muted />
+              {!cameraActive && (
+                <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '10px', background: 'rgba(15,23,42,0.88)', color: '#fff', zIndex: 1 }}>
+                  <strong>Kamera bağlantısı kapalı</strong>
+                  <button type="button" className="button" onClick={toggleCamera} disabled={busy}>
+                    Kamerayı ve mikrofonu yeniden aç
+                  </button>
+                  <span style={{ fontSize: '12px', color: '#cbd5e1' }}>Chrome izin sorarsa “İzin ver” seçeneğine tıklayın.</span>
+                </div>
+              )}
               <div className="video-overlay">
                 <span className="rec-badge"><span className="rec-dot" /> CANLI KAYIT</span>
                 <span style={{ color: '#86efac', fontSize: '11px', background: 'rgba(0,0,0,0.6)', padding: '3px 8px', borderRadius: '4px' }}>
@@ -2275,6 +2292,7 @@ function CandidateInterviewRoom({ csrf }: { csrf: string }) {
       {/* ADIM 4: C08 Uygulamalı Görev */}
       {step === 'task' && (
         <div className="card">
+          {error && <div className="error" role="alert" style={{ margin: '12px 0' }}>{error}</div>}
           <h1>{sessionData.task_template?.title || 'Uygulamalı Değerlendirme Görevi'}</h1>
           <p className="muted">{sessionData.task_template?.instructions}</p>
 
@@ -2297,7 +2315,7 @@ function CandidateInterviewRoom({ csrf }: { csrf: string }) {
             <textarea
               className="code-area"
               value={codeContent}
-              onChange={e => setCodeContent(e.target.value)}
+              onChange={e => { setCodeContent(e.target.value); setError(''); }}
               spellCheck={false}
             />
             <div style={{ marginTop: '10px', display: 'flex', gap: '10px' }}>
@@ -2318,7 +2336,7 @@ function CandidateInterviewRoom({ csrf }: { csrf: string }) {
               style={{ width: '100%', borderRadius: '8px', border: '1px solid #cbd5e1', padding: '12px', fontSize: '14px' }}
               placeholder="Hangi veri yapılarını ve optimizasyon yöntemlerini kullandınız?"
               value={explanationText}
-              onChange={e => setExplanationText(e.target.value)}
+              onChange={e => { setExplanationText(e.target.value); setError(''); }}
             />
           </div>
 
@@ -2787,9 +2805,26 @@ function CompanyReportView({ csrf }: { csrf: string }) {
   const [revisionNote, setRevisionNote] = useState('');
   const [transcriptQuery, setTranscriptQuery] = useState('');
   const [busy, setBusy] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [videoTime, setVideoTime] = useState<number>(0);
+  const [playbackSpeed, setPlaybackSpeed] = useState<number>(1);
+  const totalDuration = data?.application?.duration_seconds || 45;
 
   const reload = () => request<any>(`/api/company/applications/${id}/report`).then(setData);
   useEffect(() => { reload().catch(e => setError(e.message)); }, [id]);
+  useEffect(() => {
+    if (!isPlaying) return;
+    const interval = setInterval(() => {
+      setVideoTime(t => {
+        if (t >= totalDuration) {
+          setIsPlaying(false);
+          return totalDuration;
+        }
+        return Math.min(totalDuration, +(t + 0.5 * playbackSpeed).toFixed(1));
+      });
+    }, 500);
+    return () => clearInterval(interval);
+  }, [isPlaying, playbackSpeed, totalDuration]);
 
   const handleRevise = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -2816,25 +2851,6 @@ function CompanyReportView({ csrf }: { csrf: string }) {
 
   const overallAssessment = data.assessments?.find((a: any) => a.is_overall);
   const reqAssessments = data.assessments?.filter((a: any) => !a.is_overall);
-
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [videoTime, setVideoTime] = useState<number>(0);
-  const [playbackSpeed, setPlaybackSpeed] = useState<number>(1);
-  const totalDuration = data?.application?.duration_seconds || 45;
-
-  useEffect(() => {
-    if (!isPlaying) return;
-    const interval = setInterval(() => {
-      setVideoTime(t => {
-        if (t >= totalDuration) {
-          setIsPlaying(false);
-          return totalDuration;
-        }
-        return Math.min(totalDuration, +(t + 0.5 * playbackSpeed).toFixed(1));
-      });
-    }, 500);
-    return () => clearInterval(interval);
-  }, [isPlaying, playbackSpeed, totalDuration]);
 
   const formatSec = (s: number) => {
     const mins = Math.floor(s / 60);

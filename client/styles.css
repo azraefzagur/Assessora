@@ -146,4 +146,10 @@
   .metric-grid-4{grid-template-columns:1fr}
 }
 
+/* Application detail forms */
+.stacked-form label{display:block;font-size:13px;font-weight:600;margin:16px 0 7px}
+.stacked-form input:not([type=checkbox]),.stacked-form select{display:block;width:100%;min-width:0;border:1px solid #cbd3de;border-radius:7px;padding:10px 11px;color:#17233a;background:#fff}
+.stacked-form input[type=file]{padding:8px;font-size:13px}
+.stacked-form .actions{margin-top:18px}
+
 

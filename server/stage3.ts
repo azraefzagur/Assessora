@@ -1,6 +1,7 @@
 import type { Express, NextFunction, Request, RequestHandler, Response } from 'express';
 import { pool, transaction } from './db.ts';
-import { newId, hashPassword } from './security.ts';
+import { newId, hashPassword, createSession, setSessionCookie } from './security.ts';
+import { codeForId, codeHash, mailMode, processEmailJobs } from './email.ts';
 import { idFromInvitationToken, invitationHash } from './invitation.ts';
 import { HttpError, ValidationError, uuidPattern } from './validation.ts';
 import { extractTextFromPdf, analyzeCvContent } from './cv-analysis.ts';
@@ -32,6 +33,12 @@ async function generateAiFollowup(candidateText: string, requirementLabel: strin
 const route = (handler: (req: Request, res: Response) => Promise<unknown>): RequestHandler => (req, res, next) => {
   Promise.resolve(handler(req, res)).catch(next);
 };
+
+function maskEmail(email: string): string {
+  const [user, domain] = email.split('@');
+  if (!user || !domain) return email;
+  return `${user.slice(0, 1)}***@${domain}`;
+}
 
 export function registerStage3(
   app: Express,
@@ -87,17 +94,121 @@ export function registerStage3(
       WHERE application_id = $1
     `, [info.application_id]);
 
+    const isAuthenticated = req.session.actor_type === 'candidate' && req.session.actor_id === info.candidate_id;
+
     res.json({
       ...info,
+      candidate_email_masked: maskEmail(info.candidate_email),
+      is_authenticated: isAuthenticated,
       requirements: reqs.rows,
       session: sessionRes.rows[0] || null
     });
   }));
 
   // -------------------------------------------------------------
-  // ADAY: Mülakat Oturumu Başlatma / Sürdürme (C06 -> C07 / C12)
+  // ADAY: Davet Kabulü & Doğrulama Kodu İsteme (C03 -> C04 / AC-02)
   // -------------------------------------------------------------
-  app.post('/api/candidate/interview/session', route(async (req, res) => {
+  app.post('/api/candidate/interview/send-otp', route(async (req, res) => {
+    const { token } = req.body || {};
+    const invitationId = typeof token === 'string' ? idFromInvitationToken(token) : null;
+    if (!invitationId) throw new HttpError(404, 'Geçersiz davet bağlantısı.');
+
+    const inv = (await pool.query<{ id: string; candidate_id: string; candidate_email: string; status: string; expires_at: string }>(`
+      SELECT i.id, i.candidate_id, i.status, i.expires_at, c.email AS candidate_email
+      FROM invitations i
+      JOIN candidates c ON c.id = i.candidate_id
+      WHERE i.id = $1 AND i.token_hash = $2
+    `, [invitationId, invitationHash(invitationId)])).rows[0];
+
+    if (!inv) throw new HttpError(404, 'Davet kaydı bulunamadı.');
+    if (inv.status !== 'prepared' || new Date(inv.expires_at).getTime() <= Date.now()) {
+      throw new HttpError(410, 'Bu davetin süresi dolmuş veya iptal edilmiştir.');
+    }
+
+    const candidateId = inv.candidate_id;
+
+    const result = await transaction(async client => {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [candidateId]);
+      const previous = (await client.query<{ code_hash: string }>(
+        'SELECT code_hash FROM login_codes WHERE candidate_id=$1 ORDER BY created_at DESC LIMIT 1',
+        [candidateId]
+      )).rows[0];
+      await client.query('UPDATE login_codes SET consumed_at=now() WHERE candidate_id=$1 AND consumed_at IS NULL', [candidateId]);
+      let codeId = newId(), code = codeForId(codeId);
+      while (previous?.code_hash === codeHash(candidateId, code)) {
+        codeId = newId();
+        code = codeForId(codeId);
+      }
+      await client.query("INSERT INTO login_codes (id,candidate_id,code_hash,expires_at) VALUES ($1,$2,$3,now()+interval '15 minutes')", [
+        codeId, candidateId, codeHash(candidateId, code)
+      ]);
+      await client.query("INSERT INTO email_jobs (id,kind,login_code_id) VALUES ($1,'login_code',$2)", [newId(), codeId]);
+      return { codeId, code };
+    });
+
+    void processEmailJobs().catch(() => console.error('E-posta işi işlenemedi.'));
+
+    res.json({
+      ok: true,
+      message: 'Doğrulama kodu e-posta adresinize gönderildi.',
+      candidate_email_masked: maskEmail(inv.candidate_email),
+      ...(mailMode === 'test' && result.codeId ? { developmentCode: result.code } : {})
+    });
+  }));
+
+  // -------------------------------------------------------------
+  // ADAY: OTP Doğrulama ve Oturum Başlatma (C04 -> C05 / AC-02)
+  // -------------------------------------------------------------
+  app.post('/api/candidate/interview/verify-otp', route(async (req, res) => {
+    const { token, code } = req.body || {};
+    const invitationId = typeof token === 'string' ? idFromInvitationToken(token) : null;
+    if (!invitationId) throw new HttpError(404, 'Geçersiz davet bağlantısı.');
+
+    const codeStr = String(code || '').trim();
+    if (!/^[0-9]{6}$/.test(codeStr)) {
+      throw new HttpError(400, 'Geçerli bir 6 haneli kod girin.');
+    }
+
+    const inv = (await pool.query<{ id: string; candidate_id: string; status: string; expires_at: string }>(`
+      SELECT i.id, i.candidate_id, i.status, i.expires_at
+      FROM invitations i
+      WHERE i.id = $1 AND i.token_hash = $2
+    `, [invitationId, invitationHash(invitationId)])).rows[0];
+
+    if (!inv || inv.status !== 'prepared' || new Date(inv.expires_at).getTime() <= Date.now()) {
+      throw new HttpError(410, 'Davet geçersiz veya süresi dolmuş.');
+    }
+
+    const candidateId = inv.candidate_id;
+
+    const updated = await pool.query<{ candidate_id: string }>(`
+      UPDATE login_codes
+      SET consumed_at=now()
+      WHERE id=(SELECT id FROM login_codes WHERE candidate_id=$1 AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1)
+        AND code_hash=$2 AND expires_at>now() AND attempts<5 AND consumed_at IS NULL
+      RETURNING candidate_id
+    `, [candidateId, codeHash(candidateId, codeStr)]);
+
+    if (!updated.rows[0]) {
+      await pool.query('UPDATE login_codes SET attempts=attempts+1 WHERE id=(SELECT id FROM login_codes WHERE candidate_id=$1 AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1) AND attempts<5', [candidateId]);
+      throw new HttpError(401, 'Kod geçersiz veya süresi doldu.');
+    }
+
+    // Session rotation & candidate cookie initialization
+    if (req.session?.id_hash) {
+      await pool.query('DELETE FROM sessions WHERE id_hash=$1', [req.session.id_hash]);
+    }
+    const fresh = await createSession('candidate', candidateId, null);
+    setSessionCookie(res, fresh.token);
+
+    res.json({ ok: true, candidateId });
+  }));
+
+  // -------------------------------------------------------------
+  // ADAY: Mülakat Oturumu Başlatma / Sürdürme (C06 -> C07 / C12)
+  // AC-02: Davet e-postasını doğrulamadan mülakata erişemez
+  // -------------------------------------------------------------
+  app.post('/api/candidate/interview/session', candidate, route(async (req, res) => {
     const { token } = req.body || {};
     const invitationId = typeof token === 'string' ? idFromInvitationToken(token) : null;
     if (!invitationId) throw new HttpError(404, 'Geçersiz davet bağlantısı.');
@@ -114,6 +225,11 @@ export function registerStage3(
 
       if (!inv || inv.status !== 'prepared' || new Date(inv.expires_at).getTime() <= Date.now()) {
         throw new HttpError(410, 'Davet geçersiz veya süresi doldu.');
+      }
+
+      // AC-02: Oturum açan aday davetteki adayla eşleşmeli
+      if (inv.candidate_id !== req.session.actor_id) {
+        throw new HttpError(403, 'Bu mülakat davetine erişim yetkiniz yok. Lütfen davet edilen e-posta adresiyle giriş yapın.');
       }
 
       // Varsa mevcut oturum
@@ -229,17 +345,22 @@ export function registerStage3(
   // -------------------------------------------------------------
   // ADAY: Adım Geçişi (Briefing -> Device Check -> Interview -> Task)
   // -------------------------------------------------------------
-  app.post('/api/candidate/interview/step', route(async (req, res) => {
+  app.post('/api/candidate/interview/step', candidate, route(async (req, res) => {
     const { sessionId, step } = req.body || {};
     if (!sessionId || !uuidPattern.test(sessionId)) throw new ValidationError('Geçersiz oturum kimliği.');
     if (!['briefing', 'device_check', 'interview', 'task', 'completed'].includes(step)) {
       throw new ValidationError('Geçersiz adım.');
     }
 
+    const sessionCheck = (await pool.query('SELECT candidate_id FROM interview_sessions WHERE id = $1', [sessionId])).rows[0];
+    if (!sessionCheck || sessionCheck.candidate_id !== req.session.actor_id) {
+      throw new HttpError(403, 'Bu oturuma erişim yetkiniz yok.');
+    }
+
     const { rows } = await pool.query(`
       UPDATE interview_sessions
       SET current_step = $2,
-          status = CASE WHEN $2 = 'interview' THEN 'in_progress' ELSE status END,
+          status = CASE WHEN $2 IN ('interview', 'task') THEN 'in_progress' ELSE status END,
           started_at = CASE WHEN $2 = 'interview' AND started_at IS NULL THEN now() ELSE started_at END
       WHERE id = $1
       RETURNING *
@@ -257,9 +378,31 @@ export function registerStage3(
   }));
 
   // -------------------------------------------------------------
+  // ADAY: Bağlantı Kesintisi / Duraklatma (C12 Kurtarma Modu)
+  // -------------------------------------------------------------
+  app.post('/api/candidate/interview/interrupt', candidate, route(async (req, res) => {
+    const { sessionId } = req.body || {};
+    if (!sessionId || !uuidPattern.test(sessionId)) throw new ValidationError('Geçersiz oturum kimliği.');
+
+    const sessionCheck = (await pool.query('SELECT candidate_id FROM interview_sessions WHERE id = $1', [sessionId])).rows[0];
+    if (!sessionCheck || sessionCheck.candidate_id !== req.session.actor_id) {
+      throw new HttpError(403, 'Bu oturuma erişim yetkiniz yok.');
+    }
+
+    const { rows } = await pool.query(`
+      UPDATE interview_sessions
+      SET status = 'interrupted'
+      WHERE id = $1
+      RETURNING *
+    `, [sessionId]);
+
+    res.json({ session: rows[0], ok: true });
+  }));
+
+  // -------------------------------------------------------------
   // ADAY: Konuşma Turu Ekleme (C07 AI Mülakat Odası)
   // -------------------------------------------------------------
-  app.post('/api/candidate/interview/turn', route(async (req, res) => {
+  app.post('/api/candidate/interview/turn', candidate, route(async (req, res) => {
     const { sessionId, candidateText, currentQuestionIndex } = req.body || {};
     if (!sessionId || !uuidPattern.test(sessionId)) throw new ValidationError('Geçersiz oturum.');
     const text = String(candidateText || '').trim();
@@ -275,6 +418,9 @@ export function registerStage3(
       `, [sessionId])).rows[0];
 
       if (!session) throw new HttpError(404, 'Oturum bulunamadı.');
+      if (session.candidate_id !== req.session.actor_id) {
+        throw new HttpError(403, 'Bu oturuma erişim yetkiniz yok.');
+      }
 
       const plan = (await client.query(`
         SELECT questions FROM interview_plans WHERE position_id = $1 AND position_version = $2
@@ -413,7 +559,7 @@ export function registerStage3(
   // -------------------------------------------------------------
   // ADAY: Uygulamalı Görev Çalıştırma & Teslim (C08, C09)
   // -------------------------------------------------------------
-  app.post('/api/candidate/interview/task/execute', route(async (req, res) => {
+  app.post('/api/candidate/interview/task/execute', candidate, route(async (req, res) => {
     const { code, taskType } = req.body || {};
     const codeContent = String(code || '').trim();
 
@@ -441,7 +587,7 @@ export function registerStage3(
     res.json({ success: true, output });
   }));
 
-  app.post('/api/candidate/interview/task/submit', route(async (req, res) => {
+  app.post('/api/candidate/interview/task/submit', candidate, route(async (req, res) => {
     const { sessionId, codeContent, explanationText, taskType } = req.body || {};
     if (!sessionId || !uuidPattern.test(sessionId)) throw new ValidationError('Geçersiz oturum.');
     if (!codeContent || String(codeContent).trim().length < 5) throw new ValidationError('Lütfen görev çözüm kodunuzu girin.');
@@ -457,6 +603,9 @@ export function registerStage3(
       `, [sessionId])).rows[0];
 
       if (!session) throw new HttpError(404, 'Oturum bulunamadı.');
+      if (session.candidate_id !== req.session.actor_id) {
+        throw new HttpError(403, 'Bu oturuma erişim yetkiniz yok.');
+      }
 
       // 1. Görevi kaydet
       const submissionId = newId();
@@ -719,12 +868,18 @@ export function registerStage3(
       ORDER BY ap.created_at DESC LIMIT 1
     `, [applicationId])).rows[0] || null;
 
+    // CV Analizi (REP-06 / B05 bağlamı)
+    const cvAnalysis = (await pool.query(`
+      SELECT * FROM cv_analyses WHERE application_id = $1 ORDER BY analyzed_at DESC LIMIT 1
+    `, [applicationId])).rows[0] || null;
+
     res.json({
       application: appInfo,
       requirements: reqs,
       turns,
       submission,
       assessments: detailedAssessments,
+      cv_analysis: cvAnalysis,
       appeal
     });
   }));
@@ -839,7 +994,8 @@ export function registerStage3(
              ap.created_at, ap.decided_at,
              a.candidate_name, c.email AS candidate_email,
              p.title AS position_title,
-             u.email AS decided_by_email
+             u.email AS decided_by_email,
+             (SELECT score FROM assessments WHERE application_id = a.id AND is_overall = true LIMIT 1) AS overall_score
       FROM appeals ap
       JOIN applications a ON a.id = ap.application_id
       JOIN candidates c ON c.id = ap.candidate_id
@@ -1205,7 +1361,7 @@ export function registerStage3(
   app.get('/api/company/settings', company(), route(async (req, res) => {
     const orgId = req.session.organization_id!;
     const { rows } = await pool.query(`
-      SELECT recording_retention_days, appeal_window_days, invite_mode, allow_candidate_audio_download, feedback_contact_email, updated_at
+      SELECT recording_retention_days, appeal_window_days, invite_mode, allow_candidate_audio_download, candidate_privacy_restricted, feedback_contact_email, updated_at
       FROM organization_settings
       WHERE organization_id = $1
     `, [orgId]);
@@ -1215,6 +1371,7 @@ export function registerStage3(
       appeal_window_days: 14,
       invite_mode: 'manual',
       allow_candidate_audio_download: false,
+      candidate_privacy_restricted: true,
       feedback_contact_email: ''
     };
 
@@ -1223,28 +1380,30 @@ export function registerStage3(
 
   app.put('/api/company/settings', company(['admin']), route(async (req, res) => {
     const orgId = req.session.organization_id!;
-    const { recordingRetentionDays, appealWindowDays, inviteMode, allowCandidateAudioDownload, feedbackContactEmail } = req.body || {};
+    const { recordingRetentionDays, appealWindowDays, inviteMode, allowCandidateAudioDownload, candidatePrivacyRestricted, feedbackContactEmail } = req.body || {};
 
     const retention = Math.max(7, Math.min(365, parseInt(String(recordingRetentionDays || 90), 10)));
     const appealWindow = Math.max(3, Math.min(60, parseInt(String(appealWindowDays || 14), 10)));
     const mode = ['manual', 'auto'].includes(inviteMode) ? inviteMode : 'manual';
+    const privacy = candidatePrivacyRestricted !== undefined ? Boolean(candidatePrivacyRestricted) : true;
 
     await pool.query(`
-      INSERT INTO organization_settings (organization_id, recording_retention_days, appeal_window_days, invite_mode, allow_candidate_audio_download, feedback_contact_email, updated_at)
-      VALUES ($1, $2, $3, $4, $5, $6, now())
+      INSERT INTO organization_settings (organization_id, recording_retention_days, appeal_window_days, invite_mode, allow_candidate_audio_download, candidate_privacy_restricted, feedback_contact_email, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, now())
       ON CONFLICT (organization_id) DO UPDATE
       SET recording_retention_days = EXCLUDED.recording_retention_days,
           appeal_window_days = EXCLUDED.appeal_window_days,
           invite_mode = EXCLUDED.invite_mode,
           allow_candidate_audio_download = EXCLUDED.allow_candidate_audio_download,
+          candidate_privacy_restricted = EXCLUDED.candidate_privacy_restricted,
           feedback_contact_email = EXCLUDED.feedback_contact_email,
           updated_at = now()
-    `, [orgId, retention, appealWindow, mode, Boolean(allowCandidateAudioDownload), String(feedbackContactEmail || '').trim() || null]);
+    `, [orgId, retention, appealWindow, mode, Boolean(allowCandidateAudioDownload), privacy, String(feedbackContactEmail || '').trim() || null]);
 
     await pool.query(`
       INSERT INTO audit_logs (id, organization_id, user_id, action, entity_type, entity_id, new_values, rationale)
       VALUES ($1, $2, $3, 'settings_updated', 'organization', $4, $5, $6)
-    `, [newId(), orgId, req.session.actor_id, orgId, JSON.stringify({ retention, appealWindow, mode }), 'Kayıt saklama ve genel şirket politikası güncellendi.']);
+    `, [newId(), orgId, req.session.actor_id, orgId, JSON.stringify({ retention, appealWindow, mode, privacy }), 'Kayıt saklama ve genel şirket politikası güncellendi.']);
 
     res.json({ ok: true, message: 'Şirket ayarları başarıyla güncellendi.' });
   }));
@@ -1264,9 +1423,140 @@ export function registerStage3(
   }));
 
   // -------------------------------------------------------------
+  // ŞİRKET: Davet ve Planlama (B06)
+  // -------------------------------------------------------------
+  app.get('/api/company/invitation-planning', company(), route(async (req, res) => {
+    const orgId = req.session.organization_id!;
+    const [positions, applications, orgRow] = await Promise.all([
+      pool.query(`
+        SELECT id, title, current_version, status, created_at
+        FROM positions
+        WHERE organization_id = $1 AND status = 'active'
+        ORDER BY title ASC
+      `, [orgId]),
+      pool.query(`
+        SELECT a.id, a.candidate_name, c.email, a.position_id, p.title AS position_title,
+               a.status AS application_status, a.created_at,
+               cv.id IS NOT NULL AS has_cv, cv.review_status AS cv_review_status,
+               i.id AS invitation_id, i.status AS invitation_status, i.delivery_status,
+               i.expires_at, i.estimated_minutes
+        FROM applications a
+        JOIN candidates c ON c.id = a.candidate_id
+        JOIN positions p ON p.id = a.position_id
+        LEFT JOIN cv_documents cv ON cv.application_id = a.id
+        LEFT JOIN LATERAL (SELECT * FROM invitations WHERE application_id = a.id ORDER BY created_at DESC LIMIT 1) i ON true
+        WHERE a.organization_id = $1
+        ORDER BY a.created_at DESC
+      `, [orgId]),
+      pool.query('SELECT name FROM organizations WHERE id = $1', [orgId])
+    ]);
+
+    const orgName = orgRow.rows[0]?.name || 'Şirketimiz';
+    const defaultTemplate = {
+      subject: `Assessora Mülakat Daveti — {position_title}`,
+      body: `Sayın {candidate_name},\n\n${orgName} bünyesindeki {position_title} pozisyonu için başvurunuz değerlendirilmiş ve yapay zeka destekli teknik mülakat aşamasına davet edildiniz.\n\nMülakat bağlantınız: {link}\n\nBu bağlantı üzerinden bilgilendirme metnini inceleyebilir, kamera/mikrofon testinizi yapabilir ve mülakatınızı tamamlayabilirsiniz.\n\nBaşarılar dileriz.\n${orgName} İşe Alım Ekibi`
+    };
+
+    res.json({
+      positions: positions.rows,
+      applications: applications.rows,
+      template: defaultTemplate
+    });
+  }));
+
+  app.post('/api/company/invitations/batch-send', company(['admin', 'recruiter']), route(async (req, res) => {
+    const orgId = req.session.organization_id!;
+    const { applicationIds, estimatedMinutes, expiresAt } = req.body || {};
+    if (!Array.isArray(applicationIds) || applicationIds.length === 0) {
+      throw new ValidationError('En az bir aday seçilmelidir.');
+    }
+    const mins = Math.max(15, Math.min(120, parseInt(String(estimatedMinutes || 30), 10)));
+    const expiry = expiresAt ? new Date(expiresAt) : new Date(Date.now() + 7 * 86400000);
+
+    const createdIds: string[] = [];
+    await transaction(async client => {
+      for (const appId of applicationIds) {
+        if (!uuidPattern.test(appId)) continue;
+        const appRow = (await client.query(`
+          SELECT a.id, a.position_id, a.position_version, p.status AS position_status
+          FROM applications a
+          JOIN positions p ON p.id = a.position_id
+          WHERE a.id = $1 AND a.organization_id = $2
+        `, [appId, orgId])).rows[0];
+
+        if (!appRow || appRow.position_status !== 'active') continue;
+
+        await client.query(`
+          UPDATE invitations SET status = 'cancelled' WHERE application_id = $1 AND status = 'prepared'
+        `, [appId]);
+
+        const invId = newId();
+        await client.query(`
+          INSERT INTO invitations (id, organization_id, application_id, position_id, position_version, token_hash, estimated_minutes, expires_at, created_by_user_id, delivery_status)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
+        `, [invId, orgId, appId, appRow.position_id, appRow.position_version, invitationHash(invId), mins, expiry, req.session.actor_id]);
+
+        await client.query(`
+          INSERT INTO email_jobs (id, kind, invitation_id)
+          VALUES ($1, 'invitation', $2)
+        `, [newId(), invId]);
+
+        await client.query(`
+          UPDATE applications SET status = 'invited' WHERE id = $1
+        `, [appId]);
+
+        createdIds.push(invId);
+      }
+
+      await client.query(`
+        INSERT INTO audit_logs (id, organization_id, user_id, action, entity_type, entity_id, new_values, rationale)
+        VALUES ($1, $2, $3, 'batch_invitations_sent', 'invitation', $2, $4, $5)
+      `, [newId(), orgId, req.session.actor_id, JSON.stringify({ count: createdIds.length }), `${createdIds.length} adaya toplu mülakat daveti gönderildi.`]);
+    });
+
+    res.json({ ok: true, count: createdIds.length });
+  }));
+
+  // -------------------------------------------------------------
+  // ŞİRKET: Model Kalitesi ve Değerlendirme Geri Bildirimleri (B10)
+  // -------------------------------------------------------------
+  app.get('/api/company/feedbacks', company(), route(async (req, res) => {
+    const orgId = req.session.organization_id!;
+    const { rows } = await pool.query(`
+      SELECT ef.*, u.email AS user_email, p.title AS position_title, a.candidate_name
+      FROM evaluation_feedbacks ef
+      LEFT JOIN users u ON u.id = ef.user_id
+      LEFT JOIN positions p ON p.id = ef.position_id
+      LEFT JOIN applications a ON a.id = ef.application_id
+      WHERE ef.organization_id = $1
+      ORDER BY ef.created_at DESC
+      LIMIT 100
+    `, [orgId]);
+    res.json({ feedbacks: rows });
+  }));
+
+  app.post('/api/company/feedbacks', company(), route(async (req, res) => {
+    const orgId = req.session.organization_id!;
+    const { feedbackType, notes, positionId, applicationId } = req.body || {};
+    if (!['prompt_adjustment', 'rubric_refinement', 'scoring_accuracy', 'transcription_issue'].includes(feedbackType)) {
+      throw new ValidationError('Geçersiz geri bildirim türü.');
+    }
+    const cleanNotes = String(notes || '').trim();
+    if (cleanNotes.length < 5) throw new ValidationError('Lütfen detaylı geri bildirim notu girin.');
+
+    const fbId = newId();
+    await pool.query(`
+      INSERT INTO evaluation_feedbacks (id, organization_id, user_id, position_id, application_id, feedback_type, notes, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, 'logged')
+    `, [fbId, orgId, req.session.actor_id, positionId || null, applicationId || null, feedbackType, cleanNotes]);
+
+    res.status(201).json({ id: fbId, ok: true });
+  }));
+
+  // -------------------------------------------------------------
   // ADAY: Soruyu Açıklama / Derinleştirme İsteği (C07, INT-05)
   // -------------------------------------------------------------
-  app.post('/api/candidate/interview/clarify', route(async (req, res) => {
+  app.post('/api/candidate/interview/clarify', candidate, route(async (req, res) => {
     const { sessionId, currentQuestionIndex } = req.body || {};
     if (!sessionId || !uuidPattern.test(sessionId)) throw new ValidationError('Geçersiz oturum.');
 
@@ -1279,6 +1569,9 @@ export function registerStage3(
     `, [sessionId])).rows[0];
 
     if (!session) throw new HttpError(404, 'Oturum bulunamadı.');
+    if (session.candidate_id !== req.session.actor_id) {
+      throw new HttpError(403, 'Bu oturuma erişim yetkiniz yok.');
+    }
 
     const plan = (await pool.query(`
       SELECT questions FROM interview_plans WHERE position_id = $1 AND position_version = $2

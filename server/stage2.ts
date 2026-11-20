@@ -45,9 +45,11 @@ export function registerStage2(app:Express,company:(roles?:Membership['role'][])
     if(positionId&&!uuidPattern.test(positionId)) throw new ValidationError('Pozisyon kimliği geçersiz.');
     const {rows}=await pool.query(`SELECT a.id,a.candidate_name,c.email,p.title AS position_title,p.id AS position_id,a.status,a.created_at,
       cv.id IS NOT NULL AS has_cv,
+      cva.match_status, cva.summary AS cv_summary,
       EXISTS (SELECT 1 FROM invitations i WHERE i.application_id=a.id AND i.status='prepared' AND i.expires_at>now()) AS has_open_invitation
       FROM applications a JOIN candidates c ON c.id=a.candidate_id JOIN positions p ON p.id=a.position_id AND p.organization_id=a.organization_id
       LEFT JOIN cv_documents cv ON cv.application_id=a.id AND cv.organization_id=a.organization_id
+      LEFT JOIN cv_analyses cva ON cva.application_id=a.id
       WHERE a.organization_id=$1 AND ($2::uuid IS NULL OR a.position_id=$2) ORDER BY a.created_at DESC`,[req.session.organization_id,positionId]);
     res.json({applications:rows,role:req.membership?.role});
   }));
@@ -159,19 +161,23 @@ export function registerStage2(app:Express,company:(roles?:Membership['role'][])
   }));
 
   app.get('/api/candidate/invitations',candidate,route(async(req,res)=>{
-    const {rows}=await pool.query(`SELECT i.id,i.estimated_minutes,i.expires_at,i.position_version,a.id AS application_id,p.title AS position_title,o.name AS organization_name
+    const {rows}=await pool.query(`SELECT i.id,i.estimated_minutes,i.expires_at,i.position_version,a.id AS application_id,p.title AS position_title,o.name AS organization_name,
+      s.status AS session_status, s.current_step, s.current_question_index
       FROM invitations i JOIN applications a ON a.id=i.application_id AND a.organization_id=i.organization_id
       JOIN positions p ON p.id=i.position_id AND p.organization_id=i.organization_id JOIN organizations o ON o.id=i.organization_id
+      LEFT JOIN interview_sessions s ON s.application_id=a.id
       WHERE a.candidate_id=$1 AND i.status='prepared' AND i.expires_at>now() ORDER BY i.created_at DESC`,[req.session.actor_id]);
     res.json({invitations:rows.map(row=>({...row,path:`/aday/davet/${invitationToken(row.id)}`}))});
   }));
   app.get('/api/candidate/applications/:id',candidate,route(async(req,res)=>{
     const id=req.params.id;if(typeof id!=='string'||!uuidPattern.test(id)) throw new HttpError(404,'Başvuru bulunamadı.');
     const {rows}=await pool.query(`SELECT a.id,a.status,a.created_at,a.position_version,a.candidate_name,p.title AS position_title,o.name AS organization_name,
-      cv.id IS NOT NULL AS has_cv,i.id AS invitation_id,i.estimated_minutes,i.expires_at
+      cv.id IS NOT NULL AS has_cv,i.id AS invitation_id,i.estimated_minutes,i.expires_at,
+      row_to_json(ap.*) AS appeal
       FROM applications a JOIN positions p ON p.id=a.position_id AND p.organization_id=a.organization_id JOIN organizations o ON o.id=a.organization_id
       LEFT JOIN cv_documents cv ON cv.application_id=a.id AND cv.organization_id=a.organization_id
       LEFT JOIN LATERAL (SELECT * FROM invitations WHERE application_id=a.id AND status='prepared' AND expires_at>now() ORDER BY created_at DESC LIMIT 1) i ON true
+      LEFT JOIN LATERAL (SELECT id, status, reason, timestamp_reference, reviewer_notes, created_at FROM appeals WHERE application_id=a.id ORDER BY created_at DESC LIMIT 1) ap ON true
       WHERE a.id=$1 AND a.candidate_id=$2`,[id,req.session.actor_id]);
     if(!rows[0]) throw new HttpError(404,'Başvuru bulunamadı.');
     const item=rows[0];res.json({...item,invitation_path:item.invitation_id?`/aday/davet/${invitationToken(item.invitation_id)}`:null});

@@ -78,12 +78,59 @@ app.post('/api/logout',asyncRoute(async(req,res)=>{
 }));
 app.get('/api/company/dashboard',requireCompany(),asyncRoute(async(req,res)=>{
   const org=req.session.organization_id;
-  const [positions,applications,recent]=await Promise.all([
+  const [positions,applications,completedInterviews,pendingReviews,recent,upcomingList,pendingList,activities]=await Promise.all([
     pool.query('SELECT count(*)::int AS count FROM positions WHERE organization_id=$1',[org]),
     pool.query('SELECT count(*)::int AS count FROM applications WHERE organization_id=$1',[org]),
-    pool.query('SELECT id,title,status,created_at FROM positions WHERE organization_id=$1 ORDER BY created_at DESC LIMIT 5',[org])
+    pool.query("SELECT count(*)::int AS count FROM interview_sessions WHERE organization_id=$1 AND status IN ('submitted', 'completed')",[org]),
+    pool.query("SELECT count(*)::int AS count FROM applications WHERE organization_id=$1 AND status IN ('submitted', 'review', 'human_review', 'disputed')",[org]),
+    pool.query('SELECT id,title,status,created_at FROM positions WHERE organization_id=$1 ORDER BY created_at DESC LIMIT 5',[org]),
+    pool.query(`
+      SELECT a.id AS application_id, a.candidate_name, c.email AS candidate_email, p.title AS position_title,
+             p.id AS position_id, a.status AS application_status, s.status AS session_status,
+             COALESCE(s.started_at, i.created_at, a.created_at) AS event_date,
+             COALESCE(i.estimated_minutes, 30) AS estimated_minutes
+      FROM applications a
+      JOIN candidates c ON c.id=a.candidate_id
+      JOIN positions p ON p.id=a.position_id
+      LEFT JOIN interview_sessions s ON s.application_id=a.id
+      LEFT JOIN LATERAL (SELECT * FROM invitations WHERE application_id=a.id ORDER BY created_at DESC LIMIT 1) i ON true
+      WHERE a.organization_id=$1 AND (a.status IN ('invited', 'in_progress') OR s.status = 'in_progress')
+      ORDER BY event_date DESC LIMIT 5
+    `,[org]),
+    pool.query(`
+      SELECT a.id AS application_id, a.candidate_name, c.email AS candidate_email, p.title AS position_title,
+             p.id AS position_id, a.status AS application_status, a.created_at,
+             cv.id IS NOT NULL AS has_cv, cv.review_status AS cv_review_status,
+             s.id IS NOT NULL AS has_session, s.status AS session_status,
+             EXISTS(SELECT 1 FROM appeals ap WHERE ap.application_id=a.id AND ap.status != 'resolved') AS has_appeal
+      FROM applications a
+      JOIN candidates c ON c.id=a.candidate_id
+      JOIN positions p ON p.id=a.position_id
+      LEFT JOIN cv_documents cv ON cv.application_id=a.id
+      LEFT JOIN interview_sessions s ON s.application_id=a.id
+      WHERE a.organization_id=$1 AND (a.status IN ('submitted', 'review', 'human_review', 'disputed') OR (cv.id IS NOT NULL AND cv.review_status != 'reviewed'))
+      ORDER BY a.created_at DESC LIMIT 5
+    `,[org]),
+    pool.query(`
+      SELECT al.id, al.action, al.entity_type, al.entity_id, al.rationale, al.created_at, u.email AS user_email
+      FROM audit_logs al
+      LEFT JOIN users u ON u.id=al.user_id
+      WHERE al.organization_id=$1
+      ORDER BY al.created_at DESC LIMIT 8
+    `,[org])
   ]);
-  res.json({organization:req.membership?.name,role:req.membership?.role,positionCount:positions.rows[0].count,applicationCount:applications.rows[0].count,recent:recent.rows});
+  res.json({
+    organization:req.membership?.name,
+    role:req.membership?.role,
+    positionCount:positions.rows[0].count,
+    applicationCount:applications.rows[0].count,
+    completedInterviewCount:completedInterviews.rows[0].count,
+    pendingReviewCount:pendingReviews.rows[0].count,
+    recent:recent.rows,
+    upcomingInterviews:upcomingList.rows,
+    pendingReviews:pendingList.rows,
+    recentActivities:activities.rows
+  });
 }));
 app.get('/api/company/positions',requireCompany(),asyncRoute(async(req,res)=>{
   const {rows}=await pool.query('SELECT p.id,p.title,p.status,p.created_at,count(a.id)::int AS applicant_count FROM positions p LEFT JOIN applications a ON a.position_id=p.id AND a.organization_id=p.organization_id WHERE p.organization_id=$1 GROUP BY p.id ORDER BY p.created_at DESC',[req.session.organization_id]);

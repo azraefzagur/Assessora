@@ -6,6 +6,7 @@ import { pool, transaction } from './db.ts';
 import { newId, verifyPassword, createSession, findSession, setSessionCookie, csrfValid } from './security.ts';
 import { parsePosition, ValidationError, HttpError, uuidPattern } from './validation.ts';
 import { registerStage2 } from './stage2.ts';
+import { registerStage3 } from './stage3.ts';
 import {codeForId,codeHash,generalCodeMessage,limitHash,mailMode,processEmailJobs,startEmailWorker} from './email.ts';
 import type { Membership } from './types.ts';
 
@@ -154,6 +155,7 @@ app.get('/api/candidate/applications',candidate,asyncRoute(async(req,res)=>{
   res.json({name:found.rows[0].full_name,applications:rows});
 }));
 registerStage2(app,requireCompany,candidate);
+registerStage3(app,requireCompany,candidate);
 app.use('/api',(_req,res)=>res.status(404).json({error:'Sayfa bulunamadı.'}));
 if(process.env.NODE_ENV==='production'){
   app.use(express.static(resolve('dist')));

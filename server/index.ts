@@ -72,7 +72,7 @@ app.get('/api/session',asyncRoute(async(req,res)=>{
 app.post('/api/company/login',asyncRoute(async(req,res)=>{
   const email=String(req.body?.email||'').trim().toLowerCase(),password=String(req.body?.password||'');
   if(email.length>254||password.length>1024) return res.status(401).json({error:'E-posta veya şifre hatalı.'});
-  const {rows}=await pool.query<{id:string;password_hash:string;organization_id:string}>('SELECT u.id,u.password_hash,m.organization_id FROM users u JOIN memberships m ON m.user_id=u.id AND m.active=true WHERE lower(u.email)=$1 AND ($2::boolean OR u.development_only=false) ORDER BY m.organization_id LIMIT 1',[email,process.env.NODE_ENV==='development']);
+  const {rows}=await pool.query<{id:string;password_hash:string;organization_id:string}>('SELECT u.id,u.password_hash,m.organization_id FROM users u JOIN memberships m ON m.user_id=u.id AND m.active=true WHERE lower(u.email)=$1 AND u.password_set_at IS NOT NULL AND ($2::boolean OR u.development_only=false) ORDER BY m.organization_id LIMIT 1',[email,process.env.NODE_ENV==='development']);
   if(!rows[0]||!verifyPassword(password,rows[0].password_hash)) return res.status(401).json({error:'E-posta veya şifre hatalı.'});
   await rotate(req,res,'company',rows[0].id,rows[0].organization_id);
   res.json({ok:true});

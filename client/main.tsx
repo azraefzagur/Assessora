@@ -66,7 +66,8 @@ function App() {
       <Route path="/sirket/giris" element={<Login kind="company" csrf={session.csrf} refresh={refresh} mailMode={session.mailMode} />} />
       <Route path="/aday/giris" element={<Login kind="candidate" csrf={session.csrf} refresh={refresh} mailMode={session.mailMode} />} />
       <Route path="/aday/dogrula" element={<CandidateVerify csrf={session.csrf} refresh={refresh} />} />
-      
+      <Route path="/sirket/sifre-belirle/:token" element={<PasswordSetupPage csrf={session.csrf} />} />
+
       {/* Şirket Yolları */}
       <Route path="/sirket" element={session.actor === 'company' ? <Shell actor="company" csrf={session.csrf} refresh={refresh}><CompanyHome /></Shell> : <Navigate to="/sirket/giris" />} />
       <Route path="/sirket/pozisyonlar" element={session.actor === 'company' ? <Shell actor="company" csrf={session.csrf} refresh={refresh}><Positions /></Shell> : <Navigate to="/sirket/giris" />} />
@@ -106,6 +107,7 @@ function Login({ kind, csrf, refresh, mailMode }: { kind: 'company' | 'candidate
   const navigate = useNavigate(), [email, setEmail] = useState(''), [password, setPassword] = useState(''), [organizationName, setOrganizationName] = useState(''), [companyRegister, setCompanyRegister] = useState(false), [error, setError] = useState(''), [busy, setBusy] = useState(false);
   const submitLock = useRef(false);
   const company = kind === 'company';
+  const notice = (useLocation().state as { notice?: string } | null)?.notice;
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     if (submitLock.current) return;
@@ -138,6 +140,7 @@ function Login({ kind, csrf, refresh, mailMode }: { kind: 'company' | 'candidate
           <div className="card">
             <h2>{company ? companyRegister ? 'Şirket hesabı oluştur' : 'Şirket hesabı' : 'Aday girişi'}</h2>
             <p className="muted">{company ? companyRegister ? 'Şirketiniz için yeni bir çalışma alanı ve yönetici hesabı oluşturun.' : 'Kurumsal e-postanız ve şifrenizle devam edin.' : mailMode === 'test' ? 'Gerçek e-posta teslimatı için SMTP ayarları gereklidir. Ayarlar tamamlandığında kod bu adrese gönderilir.' : mailMode === 'smtp' ? 'E-posta adresinize tek kullanımlık bir giriş kodu göndereceğiz.' : 'E-posta gönderimi henüz yapılandırılmadı.'}</p>
+            {notice && !error && <p className="notice" role="status" style={{ marginTop: 0 }}>{notice}</p>}
             {error && <div className="error" role="alert">{error}</div>}
             <form onSubmit={submit}>
               {company && companyRegister && <>
@@ -160,6 +163,63 @@ function Login({ kind, csrf, refresh, mailMode }: { kind: 'company' | 'candidate
           <p><Link to={company ? '/aday/giris' : '/sirket/giris'}>{company ? 'Aday girişi →' : '← Şirket girişi'}</Link></p>
         </div>
       </section>
+    </div>
+  );
+}
+
+function PasswordSetupPage({ csrf }: { csrf: string }) {
+  const { token = '' } = useParams();
+  const navigate = useNavigate();
+  const [info, setInfo] = useState<{ email: string; organization: string } | null>(null);
+  const [loadError, setLoadError] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    request<{ email: string; organization: string }>(`/api/company/password-setup/${encodeURIComponent(token)}`)
+      .then(setInfo)
+      .catch(e => setLoadError((e as Error).message));
+  }, [token]);
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setError('');
+    if (password !== confirm) { setError('Şifreler eşleşmiyor.'); return; }
+    if (password.length < 12) { setError('Şifre en az 12 karakter olmalı.'); return; }
+    setBusy(true);
+    try {
+      await request('/api/company/password-setup', csrf, { token, password });
+      navigate('/sirket/giris', { replace: true, state: { notice: 'Şifreniz belirlendi. Yeni şifrenizle giriş yapabilirsiniz.' } });
+    } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+  }
+
+  return (
+    <div className="center">
+      <div className="card auth-box">
+        <h2>Şifrenizi belirleyin</h2>
+        {loadError ? (
+          <>
+            <div className="error" role="alert">{loadError}</div>
+            <p className="muted">Bağlantı kullanılmış, süresi dolmuş veya yenisi gönderilmiş olabilir. Şirket yöneticinizden yeni bağlantı isteyin.</p>
+            <p><Link to="/sirket/giris">Şirket girişine dön</Link></p>
+          </>
+        ) : !info ? <p className="muted">Bağlantı kontrol ediliyor…</p> : (
+          <>
+            <p className="muted"><strong>{info.organization}</strong> ekibine <strong>{info.email}</strong> adresiyle katılıyorsunuz.</p>
+            {error && <div className="error" role="alert">{error}</div>}
+            <form onSubmit={submit}>
+              <label htmlFor="setup-password">Yeni şifre</label>
+              <input id="setup-password" type="password" value={password} onChange={e => setPassword(e.target.value)} autoComplete="new-password" minLength={12} maxLength={128} required />
+              <label htmlFor="setup-confirm">Yeni şifre (tekrar)</label>
+              <input id="setup-confirm" type="password" value={confirm} onChange={e => setConfirm(e.target.value)} autoComplete="new-password" minLength={12} maxLength={128} required />
+              <small className="muted">En az 12 karakter kullanın.</small>
+              <button className="button" disabled={busy}>{busy ? 'Kaydediliyor…' : 'Şifremi belirle'}</button>
+            </form>
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -4235,8 +4295,8 @@ function CompanySettingsView({ csrf }: { csrf: string }) {
   // Yeni Üye Ekleme Formu
   const [newEmail, setNewEmail] = useState('');
   const [newRole, setNewRole] = useState<'admin' | 'recruiter' | 'reviewer'>('recruiter');
-  const [newPassword, setNewPassword] = useState('');
   const [showAddMember, setShowAddMember] = useState(false);
+  const [setupLink, setSetupLink] = useState('');
 
   const loadTeam = () => request<any>('/api/company/team').then(res => setTeam(res.members || []));
   const loadSettings = () => request<any>('/api/company/settings').then(res => setSettings(res.settings));
@@ -4252,16 +4312,36 @@ function CompanySettingsView({ csrf }: { csrf: string }) {
     setBusy(true);
     setError('');
     setMessage('');
+    setSetupLink('');
     try {
-      await request('/api/company/team', csrf, {
+      const res = await request<{ setupLinkSent: boolean; setupLink?: string }>('/api/company/team', csrf, {
         email: newEmail,
-        role: newRole,
-        password: newPassword || undefined
+        role: newRole
       });
-      setMessage(`Yeni ekip üyesi (${newEmail}) başarıyla eklendi.`);
+      setMessage(res.setupLinkSent
+        ? `${newEmail} ekibe eklendi. Şifresini belirlemesi için 48 saat geçerli bir bağlantı e-postayla gönderildi.`
+        : `${newEmail} ekibe eklendi. Bu kullanıcının şifresi zaten var; mevcut şifresiyle giriş yapabilir.`);
+      setSetupLink(res.setupLink || '');
       setNewEmail('');
-      setNewPassword('');
       setShowAddMember(false);
+      await loadTeam();
+      await loadAudit();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleResendSetup = async (memId: string, email: string) => {
+    setBusy(true);
+    setError('');
+    setMessage('');
+    setSetupLink('');
+    try {
+      const res = await request<{ setupLink?: string }>(`/api/company/team/${memId}/resend-setup`, csrf, {});
+      setMessage(`${email} için yeni şifre belirleme bağlantısı gönderildi. Önceki bağlantı artık geçersiz.`);
+      setSetupLink(res.setupLink || '');
       await loadTeam();
       await loadAudit();
     } catch (err) {
@@ -4342,6 +4422,12 @@ function CompanySettingsView({ csrf }: { csrf: string }) {
 
       {error && <LoadError error={error} />}
       {message && <p className="notice" role="status">{message}</p>}
+      {setupLink && (
+        <p className="notice" role="status">
+          <strong>Yerel test modu:</strong> Gerçek e-posta gönderilmedi. Şifre belirleme bağlantısı:{' '}
+          <a href={setupLink} target="_blank" rel="noreferrer">{setupLink}</a>
+        </p>
+      )}
 
       {/* Sekmeler */}
       <div className="tab-group">
@@ -4400,9 +4486,25 @@ function CompanySettingsView({ csrf }: { csrf: string }) {
                       <span className={`badge ${m.active ? 'criteria-badge full' : 'criteria-badge missing'}`}>
                         {m.active ? 'Aktif' : 'Erişim Kaldırıldı (Pasif)'}
                       </span>
+                      {m.setup_pending && (
+                        <span className="badge criteria-badge partial" style={{ marginLeft: '6px' }} title={m.setup_expires_at ? `Bağlantı ${new Date(m.setup_expires_at).toLocaleString('tr-TR')} tarihine kadar geçerli` : 'Geçerli bağlantı yok; yeniden gönderin'}>
+                          Şifre bekleniyor{!m.setup_expires_at || new Date(m.setup_expires_at).getTime() < Date.now() ? ' · bağlantı süresi doldu' : ''}
+                        </span>
+                      )}
                     </td>
                     <td>{new Date(m.created_at).toLocaleDateString('tr-TR')}</td>
-                    <td>
+                    <td style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                      {m.setup_pending && m.active && (
+                        <button
+                          type="button"
+                          className="button secondary"
+                          disabled={busy}
+                          onClick={() => handleResendSetup(m.membership_id, m.email)}
+                          style={{ padding: '4px 10px', fontSize: '12px' }}
+                        >
+                          Bağlantıyı yeniden gönder
+                        </button>
+                      )}
                       <button
                         type="button"
                         className="button secondary"
@@ -4502,14 +4604,10 @@ function CompanySettingsView({ csrf }: { csrf: string }) {
                     <option value="admin">Şirket Yöneticisi (Admin)</option>
                   </select>
 
-                  <label htmlFor="new-pass" style={{ marginTop: '14px', display: 'block' }}>İlk Giriş Parolası (Opsiyonel):</label>
-                  <input
-                    id="new-pass"
-                    type="text"
-                    value={newPassword}
-                    onChange={e => setNewPassword(e.target.value)}
-                    placeholder="Boş bırakılırsa varsayılan atanır"
-                  />
+                  <p className="muted" style={{ marginTop: '14px', fontSize: '13px' }}>
+                    Şifre siz tarafından belirlenmez. Kullanıcıya 48 saat geçerli, tek kullanımlık bir "şifreni belirle" bağlantısı
+                    e-postayla gönderilir; şifresini belirleyene kadar giriş yapamaz.
+                  </p>
 
                   <div className="actions" style={{ marginTop: '20px' }}>
                     <button className="button" disabled={busy}>Üyeyi Ekle</button>

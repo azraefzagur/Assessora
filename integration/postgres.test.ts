@@ -61,8 +61,12 @@ test('PostgreSQL üzerinde giriş, izolasyon, rol ve aday kodu',async()=>{
     await command(['server/setup.ts','candidate',orgA,positionA,'Aday A','aday-a@ornek.test'],env);
     await command(['server/setup.ts','candidate',orgB,positionB,'Aday B','aday-b@ornek.test'],env);
     const anon=await fresh(api.base);
+    const countRows=async()=>(await db.query(`SELECT (SELECT count(*) FROM candidates)::int AS c,(SELECT count(*) FROM applications)::int AS a,(SELECT count(*) FROM invitations)::int AS i`)).rows[0];
+    const before=await countRows();
     const missing=await post(api.base,'/api/candidate/code/request',anon,{email:'kayitsiz@ornek.test'});
     assert.equal(missing.status,200);const missingBody=await missing.json();assert.equal(missingBody.developmentCode,undefined);
+    // #6: Kayıtsız adres için aday, başvuru veya davet oluşturulmaz; aktif pozisyonlar olsa bile.
+    assert.deepEqual(await countRows(),before,'kod isteği kayıt oluşturmamalı');
     const requested=await post(api.base,'/api/candidate/code/request',anon,{email:'aday-a@ornek.test'});
     assert.equal(requested.status,200);
     const requestedBody=await requested.json();assert.equal(requestedBody.message,missingBody.message);

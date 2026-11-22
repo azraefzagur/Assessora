@@ -214,7 +214,7 @@ function PasswordSetupPage({ csrf }: { csrf: string }) {
               <input id="setup-password" type="password" value={password} onChange={e => setPassword(e.target.value)} autoComplete="new-password" minLength={12} maxLength={128} required />
               <label htmlFor="setup-confirm">Yeni şifre (tekrar)</label>
               <input id="setup-confirm" type="password" value={confirm} onChange={e => setConfirm(e.target.value)} autoComplete="new-password" minLength={12} maxLength={128} required />
-              <small className="muted">En az 12 karakter kullanın.</small>
+              <small className="muted" style={{ display: 'block', marginTop: '6px' }}>En az 12 karakter kullanın.</small>
               <button className="button" disabled={busy}>{busy ? 'Kaydediliyor…' : 'Şifremi belirle'}</button>
             </form>
           </>

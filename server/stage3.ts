@@ -1,5 +1,7 @@
 import type { Express, NextFunction, Request, RequestHandler, Response } from 'express';
+import { randomBytes } from 'node:crypto';
 import { pool, transaction } from './db.ts';
+import { SETUP_TOKEN_HOURS, idFromSetupToken, setupHash, setupPath } from './password-setup.ts';
 import { newId, hashPassword, createSession, setSessionCookie } from './security.ts';
 import { codeForId, codeHash, mailMode, processEmailJobs } from './email.ts';
 import { idFromInvitationToken, invitationHash, invitationToken } from './invitation.ts';
@@ -1423,7 +1425,10 @@ export function registerStage3(
     const orgId = req.session.organization_id!;
     const { rows } = await pool.query(`
       SELECT m.id AS membership_id, m.role, m.active, m.created_at,
-             u.id AS user_id, u.email, u.development_only
+             u.id AS user_id, u.email, u.development_only,
+             u.password_set_at IS NULL AS setup_pending,
+             (SELECT max(t.expires_at) FROM password_setup_tokens t
+               WHERE t.user_id = u.id AND t.organization_id = m.organization_id AND t.used_at IS NULL AND t.revoked_at IS NULL) AS setup_expires_at
       FROM memberships m
       JOIN users u ON u.id = m.user_id
       WHERE m.organization_id = $1
@@ -1433,11 +1438,23 @@ export function registerStage3(
     res.json({ members: rows });
   }));
 
+  // Şifresini belirlememiş kullanıcı için önceki bağlantıları geçersiz kılar, yeni tek kullanımlık bağlantı ve e-posta işi oluşturur.
+  async function issuePasswordSetup(client: Parameters<Parameters<typeof transaction>[0]>[0], userId: string, orgId: string, actorId: string): Promise<string> {
+    await client.query('UPDATE password_setup_tokens SET revoked_at = now() WHERE user_id = $1 AND used_at IS NULL AND revoked_at IS NULL', [userId]);
+    const tokenId = newId();
+    await client.query(`
+      INSERT INTO password_setup_tokens (id, user_id, organization_id, token_hash, expires_at, created_by_user_id)
+      VALUES ($1, $2, $3, $4, now() + make_interval(hours => $5), $6)
+    `, [tokenId, userId, orgId, setupHash(tokenId), SETUP_TOKEN_HOURS, actorId]);
+    await client.query("INSERT INTO email_jobs (id, kind, password_setup_token_id) VALUES ($1, 'password_setup', $2)", [newId(), tokenId]);
+    return tokenId;
+  }
+
   app.post('/api/company/team', company(['admin']), route(async (req, res) => {
     const orgId = req.session.organization_id!;
-    const { email, role, password } = req.body || {};
+    const { email, role } = req.body || {};
     const cleanEmail = String(email || '').trim().toLowerCase();
-    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+    if (!cleanEmail || cleanEmail.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
       throw new ValidationError('Geçerli bir e-posta adresi girin.');
     }
     if (!['admin', 'recruiter', 'reviewer'].includes(role)) {
@@ -1445,15 +1462,15 @@ export function registerStage3(
     }
 
     const result = await transaction(async client => {
-      let user = (await client.query<{ id: string }>('SELECT id FROM users WHERE lower(email) = $1', [cleanEmail])).rows[0];
+      let user = (await client.query<{ id: string; password_set_at: Date | null }>('SELECT id, password_set_at FROM users WHERE lower(email) = $1', [cleanEmail])).rows[0];
       if (!user) {
-        const pass = String(password || 'Assessora123!').trim();
+        // Kimsenin bilmediği rastgele bir özet yazılır; kullanıcı şifresini bağlantıdan belirleyene kadar giriş yapamaz.
         const userId = newId();
         await client.query(`
-          INSERT INTO users (id, email, password_hash, development_only)
-          VALUES ($1, $2, $3, false)
-        `, [userId, cleanEmail, hashPassword(pass)]);
-        user = { id: userId };
+          INSERT INTO users (id, email, password_hash, development_only, password_set_at)
+          VALUES ($1, $2, $3, false, NULL)
+        `, [userId, cleanEmail, hashPassword(randomBytes(32).toString('hex'))]);
+        user = { id: userId, password_set_at: null };
       }
 
       const existingMem = (await client.query(`
@@ -1471,15 +1488,82 @@ export function registerStage3(
         `, [newId(), orgId, user.id, role]);
       }
 
+      const tokenId = user.password_set_at ? null : await issuePasswordSetup(client, user.id, orgId, req.session.actor_id!);
+
       await client.query(`
         INSERT INTO audit_logs (id, organization_id, user_id, action, entity_type, entity_id, new_values, rationale)
         VALUES ($1, $2, $3, 'team_member_added', 'user', $4, $5, $6)
-      `, [newId(), orgId, req.session.actor_id, user.id, JSON.stringify({ email: cleanEmail, role }), 'Yeni ekip üyesi eklendi/yetkilendirildi.']);
+      `, [newId(), orgId, req.session.actor_id, user.id, JSON.stringify({ email: cleanEmail, role, setup_link_sent: Boolean(tokenId) }), 'Yeni ekip üyesi eklendi/yetkilendirildi.']);
 
-      return { ok: true, email: cleanEmail, role };
+      return { tokenId, email: cleanEmail, role };
     });
 
-    res.status(201).json(result);
+    if (result.tokenId) void processEmailJobs().catch(() => console.error('E-posta işi işlenemedi.'));
+    res.status(201).json({
+      ok: true,
+      email: result.email,
+      role: result.role,
+      setupLinkSent: Boolean(result.tokenId),
+      ...(mailMode === 'test' && result.tokenId ? { setupLink: setupPath(result.tokenId) } : {})
+    });
+  }));
+
+  app.post('/api/company/team/:membershipId/resend-setup', company(['admin']), route(async (req, res) => {
+    const membershipId = param(req.params.membershipId);
+    if (!uuidPattern.test(membershipId)) throw new ValidationError('Geçersiz üyelik kimliği.');
+    const orgId = req.session.organization_id!;
+    const tokenId = await transaction(async client => {
+      const mem = (await client.query<{ user_id: string; active: boolean; password_set_at: Date | null }>(`
+        SELECT m.user_id, m.active, u.password_set_at FROM memberships m JOIN users u ON u.id = m.user_id
+        WHERE m.id = $1 AND m.organization_id = $2 FOR UPDATE OF m
+      `, [membershipId, orgId])).rows[0];
+      if (!mem) throw new HttpError(404, 'Ekip üyesi bulunamadı.');
+      if (mem.password_set_at) throw new HttpError(409, 'Bu kullanıcı şifresini zaten belirlemiş.');
+      if (!mem.active) throw new HttpError(409, 'Pasif üyeye bağlantı gönderilemez. Önce üyeyi aktifleştirin.');
+      const id = await issuePasswordSetup(client, mem.user_id, orgId, req.session.actor_id!);
+      await client.query(`
+        INSERT INTO audit_logs (id, organization_id, user_id, action, entity_type, entity_id, rationale)
+        VALUES ($1, $2, $3, 'password_setup_resent', 'user', $4, $5)
+      `, [newId(), orgId, req.session.actor_id, mem.user_id, 'Şifre belirleme bağlantısı yeniden gönderildi.']);
+      return id;
+    });
+    void processEmailJobs().catch(() => console.error('E-posta işi işlenemedi.'));
+    res.json({ ok: true, ...(mailMode === 'test' ? { setupLink: setupPath(tokenId) } : {}) });
+  }));
+
+  // Girişsiz: bağlantının geçerli olup olmadığını ve kime ait olduğunu gösterir (yalnız bağlantıya sahip kişiye).
+  app.get('/api/company/password-setup/:token', route(async (req, res) => {
+    const id = idFromSetupToken(param(req.params.token));
+    if (!id) throw new HttpError(410, 'Bağlantı geçersiz veya süresi dolmuş.');
+    const row = (await pool.query<{ email: string; organization_name: string }>(`
+      SELECT u.email, o.name AS organization_name FROM password_setup_tokens t
+      JOIN users u ON u.id = t.user_id JOIN organizations o ON o.id = t.organization_id
+      WHERE t.id = $1 AND t.token_hash = $2 AND t.used_at IS NULL AND t.revoked_at IS NULL AND t.expires_at > now() AND u.password_set_at IS NULL
+    `, [id, setupHash(id)])).rows[0];
+    if (!row) throw new HttpError(410, 'Bağlantı geçersiz veya süresi dolmuş.');
+    res.json({ email: row.email, organization: row.organization_name });
+  }));
+
+  app.post('/api/company/password-setup', route(async (req, res) => {
+    const id = idFromSetupToken(String(req.body?.token || ''));
+    const password = String(req.body?.password || '');
+    if (!id) throw new HttpError(410, 'Bağlantı geçersiz veya süresi dolmuş.');
+    if (password.length < 12 || password.length > 128) throw new ValidationError('Şifre 12–128 karakter arasında olmalı.');
+    await transaction(async client => {
+      const row = (await client.query<{ user_id: string; organization_id: string }>(`
+        SELECT t.user_id, t.organization_id FROM password_setup_tokens t JOIN users u ON u.id = t.user_id
+        WHERE t.id = $1 AND t.token_hash = $2 AND t.used_at IS NULL AND t.revoked_at IS NULL AND t.expires_at > now() AND u.password_set_at IS NULL
+        FOR UPDATE OF t
+      `, [id, setupHash(id)])).rows[0];
+      if (!row) throw new HttpError(410, 'Bağlantı geçersiz veya süresi dolmuş.');
+      await client.query('UPDATE users SET password_hash = $1, password_set_at = now() WHERE id = $2', [hashPassword(password), row.user_id]);
+      await client.query('UPDATE password_setup_tokens SET used_at = now() WHERE id = $1', [id]);
+      await client.query(`
+        INSERT INTO audit_logs (id, organization_id, user_id, action, entity_type, entity_id, rationale)
+        VALUES ($1, $2, $3, 'password_setup_completed', 'user', $3, $4)
+      `, [newId(), row.organization_id, row.user_id, 'Kullanıcı şifresini davet bağlantısıyla belirledi.']);
+    });
+    res.json({ ok: true });
   }));
 
   app.put('/api/company/team/:membershipId', company(['admin']), route(async (req, res) => {

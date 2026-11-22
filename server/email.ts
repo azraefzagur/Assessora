@@ -3,6 +3,7 @@ import {createHmac} from 'node:crypto';
 import nodemailer from 'nodemailer';
 import {pool,transaction} from './db.ts';
 import {invitationToken} from './invitation.ts';
+import {setupPath} from './password-setup.ts';
 import {smtpDiagnostic} from './smtp-diagnostics.ts';
 
 type MailMode='disabled'|'test'|'smtp';
@@ -59,8 +60,20 @@ export async function verifySmtpConnection():Promise<void>{
   await client.verify();
 }
 class MailFailure extends Error{constructor(public kind:'rejected'|'configuration'){super(kind);}}
-type Job={id:string;kind:'login_code'|'invitation';login_code_id:string|null;invitation_id:string|null};
+type Job={id:string;kind:'login_code'|'invitation'|'password_setup';login_code_id:string|null;invitation_id:string|null;password_setup_token_id:string|null};
+const roleLabel=(role:string)=>({admin:'Yönetici',recruiter:'İşe alım uzmanı',reviewer:'Değerlendirici'}[role]||role);
 async function messageFor(job:Job):Promise<Message|null>{
+  if(job.kind==='password_setup'){
+    const {rows}=await pool.query<{id:string;email:string;expires_at:Date;used_at:Date|null;revoked_at:Date|null;organization_name:string;role:string|null}>(`SELECT t.id,u.email,t.expires_at,t.used_at,t.revoked_at,o.name AS organization_name,m.role
+      FROM password_setup_tokens t JOIN users u ON u.id=t.user_id JOIN organizations o ON o.id=t.organization_id
+      LEFT JOIN memberships m ON m.user_id=t.user_id AND m.organization_id=t.organization_id WHERE t.id=$1`,[job.password_setup_token_id]);
+    const row=rows[0];if(!row||row.used_at||row.revoked_at||new Date(row.expires_at).getTime()<=Date.now())return null;
+    const base=publicInvitationBase();if(!base)throw new MailFailure('configuration');
+    const link=`${base}${setupPath(row.id)}`,deadline=trDate(new Date(row.expires_at)),role=roleLabel(row.role||'');
+    const text=`${row.organization_name} sizi Assessora işe alım ekibine ${role} rolüyle ekledi.\n\nŞifrenizi belirlemek için kişisel bağlantınız: ${link}\nBağlantı ${deadline} tarihine kadar geçerlidir ve yalnız bir kez kullanılabilir.\n\nBu daveti beklemiyorsanız bu iletiyi dikkate almayın.`;
+    const html=`<div style="font-family:Arial,sans-serif;color:#172b50;max-width:600px"><h1 style="font-size:22px">Ekip daveti</h1><p><strong>${escapeHtml(row.organization_name)}</strong> sizi işe alım ekibine <strong>${escapeHtml(role)}</strong> rolüyle ekledi.</p><p><a href="${escapeHtml(link)}" style="background:#172b50;color:#fff;padding:12px 18px;text-decoration:none;border-radius:5px">Şifremi belirle</a></p><p>Bağlantı ${escapeHtml(deadline)} tarihine kadar geçerlidir ve yalnız bir kez kullanılabilir. Bağlantıyı paylaşmayın.</p><p>Bu daveti beklemiyorsanız bu iletiyi dikkate almayın.</p></div>`;
+    return {to:row.email,subject:'Assessora ekip daveti: şifrenizi belirleyin',text,html};
+  }
   if(job.kind==='login_code'){
     const {rows}=await pool.query<{id:string;email:string;expires_at:Date;consumed_at:Date|null}>(`SELECT lc.id,c.email,lc.expires_at,lc.consumed_at FROM login_codes lc JOIN candidates c ON c.id=lc.candidate_id WHERE lc.id=$1`,[job.login_code_id]);
     const row=rows[0];if(!row||row.consumed_at||new Date(row.expires_at).getTime()<=Date.now())return null;
@@ -85,7 +98,7 @@ export async function processEmailJobs():Promise<void>{
     await pool.query("UPDATE invitations i SET delivery_status='uncertain' FROM email_jobs j WHERE j.invitation_id=i.id AND j.status='uncertain' AND i.delivery_status='sending'");
     for(let n=0;n<10;n++){
       const job=await transaction(async client=>{
-        const row=(await client.query<Job>("SELECT id,kind,login_code_id,invitation_id FROM email_jobs WHERE status='pending' ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1")).rows[0];
+        const row=(await client.query<Job>("SELECT id,kind,login_code_id,invitation_id,password_setup_token_id FROM email_jobs WHERE status='pending' ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1")).rows[0];
         if(!row)return null;
         await client.query("UPDATE email_jobs SET status='sending',started_at=now(),attempt_count=attempt_count+1,failure_kind=NULL WHERE id=$1",[row.id]);
         if(row.invitation_id)await client.query("UPDATE invitations SET delivery_status='sending' WHERE id=$1",[row.invitation_id]);

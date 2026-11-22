@@ -854,7 +854,7 @@ CREATE TABLE assessment_runs (
 
 ---
 
-## 12. Prompt injection koruması (mülakat ve puanlama)
+## 12. Prompt injection koruması (mülakat ve puanlama) (GitHub #16)
 
 **Etiketler:** güvenlik, ai, P0 · **Şartname:** NFR-07, §15, AC-15 · **Tahmini süre:** 1,5–2 gün (kapsam takibi ve puanlamayla birlikte yürür)
 

@@ -25,7 +25,10 @@ export function publicInvitationBase():string|null{
   try{
     const url=new URL(publicUrl);
     if(url.username||url.password||url.search||url.hash||url.pathname!=='/'||!['http:','https:'].includes(url.protocol))return null;
-    if(mailMode==='smtp'&&(url.protocol!=='https:'||['localhost','127.0.0.1','::1'].includes(url.hostname)))return null;
+    if(mailMode==='smtp'){
+      const localDevelopment=process.env.NODE_ENV==='development'&&url.protocol==='http:'&&['localhost','127.0.0.1','::1'].includes(url.hostname);
+      if(!localDevelopment&&(url.protocol!=='https:'||['localhost','127.0.0.1','::1'].includes(url.hostname)))return null;
+    }
     return url.origin;
   }catch{return null;}
 }

@@ -13,7 +13,7 @@
     "setup": "tsx server/setup.ts",
     "import:sqlite": "tsx server/import-sqlite.ts",
     "test": "tsx --test server/*.test.ts",
-    "test:integration": "tsx --test integration/postgres.test.ts integration/stage2.test.ts integration/email.test.ts",
+    "test:integration": "tsx --test integration/postgres.test.ts integration/stage2.test.ts integration/email.test.ts integration/team-password-setup.test.ts",
     "test:browser": "tsx --test integration/browser.test.ts"
   },
   "dependencies": {
